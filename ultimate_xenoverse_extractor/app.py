@@ -22,6 +22,7 @@ from .parsers import EmbFormatError, EmdFormatError, EmmFormatError, EskFormatEr
 from .viewport import ModelViewport
 from .settings import load_settings, save_settings
 from .source_export import ExportOptions, export_character
+from .ui_sounds import UISoundManager
 
 APP_NAME = "Ultimate Xenoverse Extractor"
 BLUE = QColor("#78bfff")
@@ -43,8 +44,16 @@ class MainWindow(QMainWindow):
         self.additional_camera_sources: list[tuple[object, object, str, Path]] = []
         self.animation_sources: list[tuple[object, object, str, Path, bool]] = []
         self.settings = load_settings()
+        self.ui_sounds = UISoundManager(
+            project_root / "sounds",
+            enabled=bool(self.settings.get("ui_sounds_enabled", True)),
+            parent=self,
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self.ui_sounds)
 
-        self.setWindowTitle(f"{APP_NAME} - 0.1.1")
+        self.setWindowTitle(f"{APP_NAME} - 0.1.2")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
@@ -74,6 +83,12 @@ class MainWindow(QMainWindow):
         reset_layout_action = QAction("Reset Layout", self)
         reset_layout_action.triggered.connect(self.reset_layout)
         toolbar.addAction(reset_layout_action)
+
+        self.ui_sounds_action = QAction("UI Sounds", self)
+        self.ui_sounds_action.setCheckable(True)
+        self.ui_sounds_action.setChecked(self.ui_sounds.enabled)
+        self.ui_sounds_action.toggled.connect(self.set_ui_sounds_enabled)
+        toolbar.addAction(self.ui_sounds_action)
         toolbar.addSeparator()
 
         self.path_label = QLabel(" No asset directory selected ")
@@ -399,6 +414,7 @@ class MainWindow(QMainWindow):
         self.extract_button.clicked.connect(self.extract_character)
         export_layout.addWidget(self.extract_button)
         self.tabs.addTab(export_tab, "Extract")
+        self.tabs.currentChanged.connect(lambda _index: self.ui_sounds.play_page_change())
         right_layout.addWidget(self.tabs)
         root_split.addWidget(right)
         # All three regions remain user-resizable. The center takes most extra
@@ -439,6 +455,26 @@ class MainWindow(QMainWindow):
             QSplitter::handle:vertical { height: 9px; }
         """)
 
+    def set_ui_sounds_enabled(self, enabled: bool) -> None:
+        self.ui_sounds.set_enabled(enabled)
+        self.settings["ui_sounds_enabled"] = bool(enabled)
+        save_settings(self.settings)
+        if enabled:
+            self.ui_sounds.play_click()
+            loaded = self.ui_sounds.loaded_count
+            location = self.ui_sounds.active_directory
+            if loaded:
+                self.statusBar().showMessage(
+                    f"UI sounds enabled", 6000
+                )
+            else:
+                self.statusBar().showMessage(
+                    "UI sounds enabled, but no WAV files were found or decoded. Check the sounds folder.",
+                    8000,
+                )
+        else:
+            self.statusBar().showMessage("UI sounds disabled", 3000)
+
     def restore_layout(self) -> None:
         root_sizes = self.settings.get("root_split_sizes")
         center_sizes = self.settings.get("center_split_sizes")
@@ -461,6 +497,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Layout reset", 3000)
 
     def closeEvent(self, event) -> None:
+        self.ui_sounds.play_window_close()
         self.settings["root_split_sizes"] = self.root_split.sizes()
         self.settings["center_split_sizes"] = self.center_split.sizes()
         self.settings["material_split_sizes"] = self.material_split.sizes()
@@ -1327,4 +1364,5 @@ def main() -> int:
     project_root = Path(__file__).resolve().parent.parent
     window = MainWindow(project_root)
     window.show()
+    QTimer.singleShot(250, window.ui_sounds.play_window_open)
     return app.exec()
