@@ -1,34 +1,24 @@
-# Ultimate Xenoverse Extractor — Phase 1
+# Ultimate Xenoverse Extractor
 
-A functional first-stage GUI and asset indexer for Xenoverse 2 extraction workflows.
+A functional/modern GUI and asset indexer for Xenoverse 2 extraction workflows.
 
-## Current implementation
+## Pre-requisites
 
-- First-run extracted-assets directory picker with persistent settings.
-- Scans either `data`, `data/chara`, or a direct folder of character-code directories.
-- Parses the bundled HTML ID lists without external HTML libraries.
-- Resolves character display names and retains original codes, e.g. `Goku [GOK]`.
-- Blue/red/gray availability coloring from the ID list.
-- Searchable category library.
-- Per-character asset classification for EMD, ESK, EMM, EMB/DYT, EAN, camera EAN, face/lip EAN, BCS, BAC, BCM, BDM, and BAI.
-- Automatic main-rig and same-name physics-rig assignment preview.
-- Model, animation, and extraction inspector UI.
-- The bundled example `XBF` folder loads automatically if the first directory dialog is cancelled.
+You MUST have your Xenoverse 2 files extracted somewhere, you can use a CPKBrowser to rip the assets.
 
-## Run
+## Usage
 
-```bat
-py -m pip install -r requirements.txt
-py run_extractor.py
-```
+Run 'install_and_run.bat' to launch the tool. It will automatically install any required python modules that the tool utilizes. You can view Xenoverse 2's models/animations/textures among other things as well as extract them to SMD/TGA/JSON formats.
 
-Or run `install_and_run.bat` on Windows.
+## Media
 
-## Architecture
+<img width="2551" height="1307" alt="1_default" src="https://github.com/user-attachments/assets/b543111d-4ce6-44d0-a1c3-900068427d71" />
+<img width="2546" height="1300" alt="2_mdl" src="https://github.com/user-attachments/assets/8967533d-1177-4110-9cf7-131741583f77" />
+<img width="974" height="1235" alt="3_mat" src="https://github.com/user-attachments/assets/db286767-8d61-485d-b7e9-4ae006d54713" />
+<img width="1769" height="1123" alt="4_anim" src="https://github.com/user-attachments/assets/bf197247-f740-49da-aa6c-bbaf4631a213" />
 
-- `id_lists.py`: HTML table parser and ID indexes.
-- `scanner.py`: library discovery, file classification, and automatic skeleton pairing.
-- `models.py`: neutral data structures shared by future native parsers and exporters.
-- `app.py`: PySide6 GUI.
+## Credits
 
-The next stage should add native binary readers under `ultimate_xenoverse_extractor/formats/`, beginning with ESK and EMD. The Source exporter should consume the neutral structures, not raw file offsets, so coordinate conversion is applied exactly once.
+- Cpt. Hazama - Making the tool, debugging
+- Olganix - libXenoverse2
+- ChatGPT - GUI help
