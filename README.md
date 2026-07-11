@@ -1,6 +1,6 @@
 # Ultimate Xenoverse Extractor
 
-A functional/modern GUI and asset indexer for Xenoverse 2 extraction workflows.
+A functional/modern GUI and asset indexer for Xenoverse 2 extraction workflows. The main purpose of this tool is for extraction, if you're looking for something pertaining to modding Xenoverse itself, this is not the correct place lol.
 
 ## Pre-requisites
 
