@@ -44,7 +44,7 @@ class MainWindow(QMainWindow):
         self.animation_sources: list[tuple[object, object, str, Path, bool]] = []
         self.settings = load_settings()
 
-        self.setWindowTitle(f"{APP_NAME} - 0.1.0")
+        self.setWindowTitle(f"{APP_NAME} - 0.1.1")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
@@ -1035,10 +1035,15 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
     def populate_aux_animation_combos(self) -> None:
-        """Populate face, lip, and camera selectors without unsafe auto-matching."""
+        """Populate auxiliary selectors without unsafe auto-matching.
+
+        Face and lip selectors store integer indices into their owning EAN. Camera
+        selectors must store the animation object itself because the same combo also
+        contains camera clips appended from multiple skill EAN files.
+        """
         self._populate_animation_combo(self.face_combo, self.face_ean)
         self._populate_animation_combo(self.lip_combo, self.lip_ean)
-        self._populate_animation_combo(self.camera_combo, self.camera_ean)
+        self._rebuild_camera_combo()
 
     @staticmethod
     def _selected_aux_animation(combo: QComboBox, ean):
@@ -1075,8 +1080,20 @@ class MainWindow(QMainWindow):
         return self._selected_aux_animation(self.lip_combo, self.lip_ean)
 
     def selected_camera_animation(self):
-        animation = self.camera_combo.currentData()
-        return animation if hasattr(animation, "name") else None
+        data = self.camera_combo.currentData()
+
+        # Current camera-combo entries store the EanAnimation object directly so
+        # character and appended skill cameras can coexist. Retain integer support
+        # for any stale combo state created by an older build.
+        if hasattr(data, "name"):
+            return data
+        if (
+            isinstance(data, int)
+            and self.camera_ean is not None
+            and 0 <= data < len(self.camera_ean.animations)
+        ):
+            return self.camera_ean.animations[data]
+        return None
 
     def _try_load_aux_ean(self, path: Path | None):
         if path is None:
