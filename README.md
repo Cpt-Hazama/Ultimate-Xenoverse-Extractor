@@ -22,3 +22,4 @@ Run 'install_and_run.bat' to launch the tool. It will automatically install any 
 - Cpt. Hazama - Making the tool, debugging
 - Olganix - libXenoverse2
 - ChatGPT - GUI help
+- Demon - For creating the Xenoverse 2 ID lists
