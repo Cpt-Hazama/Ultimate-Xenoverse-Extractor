@@ -145,10 +145,10 @@ def _view_from_basis(camera: Vec3, right: Vec3, up: Vec3, forward: Vec3) -> np.n
 class ModelViewport(QOpenGLWidget):
     """GPU-backed XV2 viewport.
 
-    Geometry, textures, depth testing, alpha blending, and wireframe rendering
-    are handled by OpenGL. CPU skinning is retained for now so the existing
-    parser/animation pipeline remains compatible; only the dynamic position
-    buffer is updated per frame.
+    Geometry, textures, depth testing, alpha blending, wireframe rendering,
+    and skeletal skinning are handled by OpenGL. Python only evaluates the
+    relatively small bone pose each frame; mesh vertices remain in static GPU
+    buffers and are deformed in the vertex shader.
     """
 
     statusChanged = Signal(str)
@@ -199,6 +199,10 @@ class ModelViewport(QOpenGLWidget):
         self.line_vbo = None
         self.line_vao = None
         self.white_texture = None
+        self.bone_texture = None
+        self._bone_texture_height = 0
+        self._bone_texture_data: np.ndarray | None = None
+        self._bone_texture_dirty = True
         self._gl_ready = False
         self._gpu_error: str | None = None
         self._qt_framebuffer = None
@@ -217,11 +221,41 @@ class ModelViewport(QOpenGLWidget):
                     #version 330
                     in vec3 in_position;
                     in vec2 in_uv;
+                    in vec4 in_bone_indices;
+                    in vec4 in_bone_weights;
                     uniform mat4 u_mvp;
                     uniform vec2 u_uv_scale;
+                    uniform sampler2D u_bone_matrices;
+                    uniform bool u_use_skinning;
                     out vec2 v_uv;
+
+                    mat4 fetch_bone_matrix(int bone_index) {
+                        return mat4(
+                            texelFetch(u_bone_matrices, ivec2(0, bone_index), 0),
+                            texelFetch(u_bone_matrices, ivec2(1, bone_index), 0),
+                            texelFetch(u_bone_matrices, ivec2(2, bone_index), 0),
+                            texelFetch(u_bone_matrices, ivec2(3, bone_index), 0)
+                        );
+                    }
+
                     void main() {
-                        gl_Position = u_mvp * vec4(in_position, 1.0);
+                        vec4 position = vec4(in_position, 1.0);
+                        if (u_use_skinning) {
+                            mat4 skin = mat4(0.0);
+                            float total_weight = 0.0;
+                            for (int slot = 0; slot < 4; ++slot) {
+                                float weight = in_bone_weights[slot];
+                                int bone_index = int(in_bone_indices[slot] + 0.5);
+                                if (weight > 0.000001 && bone_index >= 0) {
+                                    skin += fetch_bone_matrix(bone_index) * weight;
+                                    total_weight += weight;
+                                }
+                            }
+                            if (total_weight > 0.000001) {
+                                position = (skin / total_weight) * position;
+                            }
+                        }
+                        gl_Position = u_mvp * position;
                         v_uv = vec2(in_uv.x * u_uv_scale.x,
                                     in_uv.y * u_uv_scale.y);
                     }
@@ -258,6 +292,7 @@ class ModelViewport(QOpenGLWidget):
             self.line_vao = self.ctx.simple_vertex_array(self.line_program, self.line_vbo, "in_position")
             self.white_texture = self.ctx.texture((1, 1), 4, bytes((255, 255, 255, 255)))
             self.white_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._ensure_bone_texture(max(1, len(self._pose_positions)))
             # QOpenGLWidget renders into an internal framebuffer rather than
             # OpenGL framebuffer 0. ModernGL must explicitly target that FBO.
             self._bind_qt_framebuffer(force=True)
@@ -307,6 +342,7 @@ class ModelViewport(QOpenGLWidget):
         self.ctx.viewport = (0, 0, max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio)))
         self.ctx.enable(moderngl.DEPTH_TEST | moderngl.BLEND)
         self.ctx.clear(0.035, 0.045, 0.058, 1.0, depth=1.0)
+        self._upload_bone_texture_if_needed()
         mvp = self._mvp_matrix()
 
         if self.show_grid:
@@ -346,30 +382,49 @@ class ModelViewport(QOpenGLWidget):
             surface.gpu_dirty = True
             return
 
-        vertex_count = len(surface.vertices)
+        bind_vertices = surface.bind_vertices or surface.vertices
+        vertex_count = len(bind_vertices)
         if vertex_count == 0:
             return
-        positions = np.asarray(surface.vertices, dtype=np.float32)
+        positions = np.asarray(bind_vertices, dtype=np.float32)
         uv_data = np.zeros((vertex_count, 2), dtype=np.float32)
         if surface.uvs:
             for index, uv in enumerate(surface.uvs[:vertex_count]):
                 if uv is not None:
                     uv_data[index] = uv
-        interleaved = np.concatenate((positions, uv_data), axis=1).astype(np.float32, copy=False)
+
+        bone_indices = np.full((vertex_count, 4), -1.0, dtype=np.float32)
+        bone_weights = np.zeros((vertex_count, 4), dtype=np.float32)
+        palette = surface.resolved_bones or []
+        local_indices = surface.blend_indices or []
+        local_weights = surface.blend_weights or []
+        for vertex_index in range(vertex_count):
+            indices4 = local_indices[vertex_index] if vertex_index < len(local_indices) else None
+            weights4 = local_weights[vertex_index] if vertex_index < len(local_weights) else None
+            if indices4 is None or weights4 is None:
+                continue
+            for slot in range(4):
+                palette_index = indices4[slot]
+                if palette_index < len(palette):
+                    resolved = palette[palette_index]
+                    if resolved is not None:
+                        bone_indices[vertex_index, slot] = float(resolved)
+                        bone_weights[vertex_index, slot] = float(weights4[slot])
+
+        interleaved = np.concatenate((positions, uv_data, bone_indices, bone_weights), axis=1).astype(np.float32, copy=False)
         indices = np.asarray(surface.triangles, dtype=np.uint32).reshape(-1)
 
         if rebuild or surface.gpu.vbo is None or surface.gpu.index_count != len(indices):
             self._release_surface_gpu(surface)
-            surface.gpu.vbo = self.ctx.buffer(interleaved.tobytes(), dynamic=True)
+            # Static mesh data: animation no longer rewrites this buffer.
+            surface.gpu.vbo = self.ctx.buffer(interleaved.tobytes())
             surface.gpu.ibo = self.ctx.buffer(indices.tobytes())
             surface.gpu.vao = self.ctx.vertex_array(
                 self.mesh_program,
-                [(surface.gpu.vbo, "3f 2f", "in_position", "in_uv")],
+                [(surface.gpu.vbo, "3f 2f 4f 4f", "in_position", "in_uv", "in_bone_indices", "in_bone_weights")],
                 surface.gpu.ibo,
             )
             surface.gpu.index_count = len(indices)
-        else:
-            surface.gpu.vbo.write(interleaved.tobytes())
 
         texture_key = surface.texture.cacheKey() if surface.texture is not None else None
         if texture_key != surface.gpu.texture_key:
@@ -409,6 +464,8 @@ class ModelViewport(QOpenGLWidget):
         self._pose_positions.clear()
         self._pose_rotations.clear()
         self._pose_scales.clear()
+        self._bone_texture_data = None
+        self._bone_texture_dirty = True
         self.update()
         self.statusChanged.emit("Viewport cleared")
 
@@ -522,6 +579,12 @@ class ModelViewport(QOpenGLWidget):
         self.animation_frame = 0.0
         self._build_bind_pose()
         self._resolve_surface_bones()
+        if self._gl_ready:
+            self.makeCurrent()
+            for part in self.parts.values():
+                for surface in part.surfaces:
+                    self._upload_surface(surface, rebuild=True)
+            self.doneCurrent()
         self._rebuild_skeleton_pose()
         self.fit_scene()
         self.statusChanged.emit(f"Loaded {esk.path.name}: {len(esk.bones)} bones")
@@ -591,6 +654,7 @@ class ModelViewport(QOpenGLWidget):
         for part in self.parts.values():
             for surface in part.surfaces:
                 surface.resolved_bones = [by_name.get(name) for name in (surface.bone_palette_names or [])]
+                surface.gpu_dirty = True
 
     @staticmethod
     def _inverse_bind_point(point: Vec3, position: Vec3, rotation: Quat, scale: Vec3) -> Vec3:
@@ -604,56 +668,84 @@ class ModelViewport(QOpenGLWidget):
         scaled = tuple(point[i] * scale[i] for i in range(3))
         return _vadd(position, _quat_rotate(rotation, scaled))
 
-    def _skin_meshes(self) -> None:
-        if not self._bind_positions or not self._pose_positions:
-            return
-        bone_count = len(self._pose_positions)
-        changed: list[RenderSurface] = []
-        for part in self.parts.values():
-            for surface in part.surfaces:
-                bind_vertices = surface.bind_vertices
-                indices_list = surface.blend_indices
-                weights_list = surface.blend_weights
-                palette = surface.resolved_bones
-                if not bind_vertices:
-                    continue
-                if not indices_list or not weights_list or not palette:
-                    surface.vertices = list(bind_vertices)
-                    changed.append(surface)
-                    continue
-                deformed: list[Vec3] = []
-                for vertex_index, bind_vertex in enumerate(bind_vertices):
-                    local_indices = indices_list[vertex_index] if vertex_index < len(indices_list) else None
-                    weights = weights_list[vertex_index] if vertex_index < len(weights_list) else None
-                    if local_indices is None or weights is None:
-                        deformed.append(bind_vertex)
-                        continue
-                    result = (0.0, 0.0, 0.0)
-                    total = 0.0
-                    for slot in range(4):
-                        weight = weights[slot]
-                        palette_index = local_indices[slot]
-                        if weight <= 1e-6 or palette_index >= len(palette):
-                            continue
-                        bone_index = palette[palette_index]
-                        if bone_index is None or bone_index >= bone_count:
-                            continue
-                        local = self._inverse_bind_point(bind_vertex, self._bind_positions[bone_index],
-                                                         self._bind_rotations[bone_index], self._bind_scales[bone_index])
-                        posed = self._pose_point(local, self._pose_positions[bone_index],
-                                                self._pose_rotations[bone_index], self._pose_scales[bone_index])
-                        result = _vadd(result, _vmul(posed, weight))
-                        total += weight
-                    deformed.append(_vmul(result, 1.0 / total) if total > 1e-6 else bind_vertex)
-                surface.vertices = deformed
-                surface.gpu_dirty = True
-                changed.append(surface)
+    @staticmethod
+    def _transform_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> np.ndarray:
+        x, y, z, w = rotation
+        length = math.sqrt(x * x + y * y + z * z + w * w)
+        if length > 1e-8:
+            x, y, z, w = x / length, y / length, z / length, w / length
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        rotation_matrix = np.array((
+            (1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)),
+            (2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)),
+            (2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)),
+        ), dtype=np.float32)
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :3] = rotation_matrix @ np.diag(np.asarray(scale, dtype=np.float32))
+        matrix[:3, 3] = np.asarray(position, dtype=np.float32)
+        return matrix
 
-        if self._gl_ready and changed:
-            self.makeCurrent()
-            for surface in changed:
-                self._upload_surface(surface, rebuild=False)
-            self.doneCurrent()
+    def _build_skin_matrices(self) -> np.ndarray:
+        count = min(len(self._bind_positions), len(self._pose_positions))
+        if count <= 0:
+            return np.eye(4, dtype=np.float32)[None, ...]
+        matrices = np.empty((count, 4, 4), dtype=np.float32)
+        for index in range(count):
+            bind = self._transform_matrix(
+                self._bind_positions[index], self._bind_rotations[index], self._bind_scales[index]
+            )
+            pose = self._transform_matrix(
+                self._pose_positions[index], self._pose_rotations[index], self._pose_scales[index]
+            )
+            try:
+                matrices[index] = pose @ np.linalg.inv(bind)
+            except np.linalg.LinAlgError:
+                matrices[index] = np.eye(4, dtype=np.float32)
+        return matrices
+
+    def _ensure_bone_texture(self, bone_count: int) -> None:
+        if not self._gl_ready and self.ctx is None:
+            return
+        if self.ctx is None:
+            return
+        height = max(1, int(bone_count))
+        if self.bone_texture is not None and self._bone_texture_height == height:
+            return
+        if self.bone_texture is not None:
+            try:
+                self.bone_texture.release()
+            except Exception:
+                pass
+        identity = np.eye(4, dtype=np.float32)[None, ...]
+        initial = np.repeat(identity, height, axis=0)
+        # Texture layout is [bone, matrix-column, column-components].
+        packed = np.transpose(initial, (0, 2, 1)).copy()
+        self.bone_texture = self.ctx.texture((4, height), 4, packed.tobytes(), dtype="f4")
+        self.bone_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.bone_texture.repeat_x = False
+        self.bone_texture.repeat_y = False
+        self._bone_texture_height = height
+        self._bone_texture_dirty = True
+
+    def _upload_bone_texture_if_needed(self) -> None:
+        if not self._bone_texture_dirty or self.ctx is None:
+            return
+        matrices = self._bone_texture_data
+        if matrices is None:
+            matrices = self._build_skin_matrices()
+        self._ensure_bone_texture(len(matrices))
+        if self.bone_texture is None:
+            return
+        packed = np.transpose(matrices.astype(np.float32, copy=False), (0, 2, 1)).copy()
+        self.bone_texture.write(packed.tobytes())
+        self._bone_texture_dirty = False
+
+    def _skin_meshes(self) -> None:
+        """Queue GPU skinning data instead of deforming every vertex in Python."""
+        self._bone_texture_data = self._build_skin_matrices()
+        self._bone_texture_dirty = True
 
     def _rebuild_skeleton_pose(self) -> None:
         esk = self.current_esk
@@ -809,6 +901,9 @@ class ModelViewport(QOpenGLWidget):
         if self.ctx is None or self.mesh_program is None:
             return
         self._write_matrix(self.mesh_program, "u_mvp", mvp)
+        if self.bone_texture is not None:
+            self.bone_texture.use(1)
+            self.mesh_program["u_bone_matrices"].value = 1
         for part in self.parts.values():
             if not part.visible:
                 continue
@@ -819,6 +914,8 @@ class ModelViewport(QOpenGLWidget):
                     continue
                 rgba = tuple(channel / 255.0 for channel in surface.color)
                 has_texture = surface.gpu.texture_obj is not None
+                has_skinning = bool(self.current_esk is not None and surface.resolved_bones and surface.blend_weights)
+                self.mesh_program["u_use_skinning"].value = has_skinning
                 if self.show_solid:
                     self.ctx.wireframe = False
                     self.mesh_program["u_color"].value = (1.0, 1.0, 1.0, rgba[3]) if has_texture else rgba
