@@ -8,7 +8,7 @@ You MUST have your Xenoverse 2 files extracted somewhere, you can use a CPKBrows
 
 ## Usage
 
-Run 'install_and_run.bat' to launch the tool. It will automatically install any required python modules that the tool utilizes. You can view Xenoverse 2's models/animations/textures among other things as well as extract them to SMD/TGA/JSON formats.
+Run 'install_and_run.bat' to launch the tool. It will automatically install any required python modules that the tool utilizes. You can view Xenoverse 2's models/animations/textures/sounds among other things as well as extract them to SMD/TGA/JSON/WAV formats.
 
 ## Media
 
