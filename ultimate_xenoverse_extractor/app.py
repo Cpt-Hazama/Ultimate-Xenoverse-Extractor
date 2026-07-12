@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+import gc
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QSize, QTimer
-    from PySide6.QtGui import QAction, QColor, QFont, QBrush, QPixmap
+    from PySide6.QtCore import Qt, QSize, QTimer, QUrl
+    from PySide6.QtGui import QAction, QColor, QFont, QBrush, QPixmap, QIcon
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
         QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
@@ -23,6 +25,13 @@ from .viewport import ModelViewport
 from .settings import load_settings, save_settings
 from .source_export import ExportOptions, export_character
 from .ui_sounds import UISoundManager
+from .sound_tools import (
+    SoundBank, SoundStream, SoundToolError, decode_stream, decode_stream_to_temp,
+    extract_all_streams, inspect_sound_bank, read_stream_metadata, safe_stream_filename,
+)
+from .cac_profiles import (
+    build_cac_entries, load_profiles, parse_save_xml, resolve_skill_entries, save_profiles,
+)
 
 APP_NAME = "Ultimate Xenoverse Extractor"
 BLUE = QColor("#78bfff")
@@ -36,6 +45,8 @@ class MainWindow(QMainWindow):
         self.project_root = project_root
         self.id_dir = project_root / "_IDLists"
         self.id_lists = load_all_id_lists(self.id_dir)
+        self.cac_store_path = project_root / "userdata" / "cac_profiles.json"
+        self.cac_profiles = load_profiles(self.cac_store_path)
         self.entries: list[LibraryEntry] = []
         self.current_entry: LibraryEntry | None = None
         self.current_character_entry: LibraryEntry | None = None
@@ -44,6 +55,23 @@ class MainWindow(QMainWindow):
         self.additional_camera_sources: list[tuple[object, object, str, Path]] = []
         self.animation_sources: list[tuple[object, object, str, Path, bool]] = []
         self.settings = load_settings()
+        self.portrait_cache: dict[str, QIcon] = {}
+        self._portrait_queue: list[tuple[QTreeWidgetItem, Path, int]] = []
+        self._portrait_generation = 0
+        self._portrait_batch_timer = QTimer(self)
+        self._portrait_batch_timer.setSingleShot(True)
+        self._portrait_batch_timer.timeout.connect(self._process_portrait_batch)
+        self.current_sound_entry: LibraryEntry | None = None
+        self.current_sound_bank: SoundBank | None = None
+        self.sound_audio_output = QAudioOutput(self)
+        self.sound_audio_output.setVolume(0.8)
+        self.sound_player = QMediaPlayer(self)
+        self.sound_player.setAudioOutput(self.sound_audio_output)
+        self._sound_metadata_generation = 0
+        self._sound_metadata_index = 0
+        self._sound_metadata_timer = QTimer(self)
+        self._sound_metadata_timer.setSingleShot(True)
+        self._sound_metadata_timer.timeout.connect(self._load_next_sound_metadata)
         self.ui_sounds = UISoundManager(
             project_root / "sounds",
             enabled=bool(self.settings.get("ui_sounds_enabled", True)),
@@ -53,7 +81,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self.ui_sounds)
 
-        self.setWindowTitle(f"{APP_NAME} - 0.1.3")
+        self.setWindowTitle(f"{APP_NAME} - 0.1.5")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
@@ -79,6 +107,11 @@ class MainWindow(QMainWindow):
         refresh_action = QAction("Refresh Library", self)
         refresh_action.triggered.connect(self.refresh)
         toolbar.addAction(refresh_action)
+
+        # Disabled until I can fully figure out CaC stuff
+        # import_cac_action = QAction("Import XV2 Save XML", self)
+        # import_cac_action.triggered.connect(self.import_cac_save_xml)
+        # toolbar.addAction(import_cac_action)
 
         reset_layout_action = QAction("Reset Layout", self)
         reset_layout_action.triggered.connect(self.reset_layout)
@@ -118,6 +151,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.search)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
+        self.tree.setIconSize(QSize(42, 42))
         self.tree.itemSelectionChanged.connect(self.library_selection_changed)
         left_layout.addWidget(self.tree)
         legend = QLabel("Blue: playable / CaC usable    Red: non-usable    Gray: unknown")
@@ -395,6 +429,33 @@ class MainWindow(QMainWindow):
         self.camera_box.toggled.connect(self.refresh_animation_overlays)
         self.camera_combo.currentIndexChanged.connect(self.refresh_animation_overlays)
         self.tabs.addTab(animation_tab, "Animations")
+
+        sound_tab = QWidget()
+        sound_layout = QVBoxLayout(sound_tab)
+        self.sound_meta = QLabel("Select an ACB sound bank from the library.")
+        self.sound_meta.setObjectName("muted")
+        self.sound_meta.setWordWrap(True)
+        sound_layout.addWidget(self.sound_meta)
+        self.sound_list = QListWidget()
+        self.sound_list.currentRowChanged.connect(self.sound_stream_selected)
+        self.sound_list.itemDoubleClicked.connect(lambda _item: self.play_selected_sound())
+        sound_layout.addWidget(self.sound_list, 1)
+        sound_buttons = QHBoxLayout()
+        self.sound_play_button = QPushButton("Play")
+        self.sound_stop_button = QPushButton("Stop")
+        self.sound_extract_button = QPushButton("Extract Selected")
+        self.sound_extract_all_button = QPushButton("Extract All")
+        self.sound_play_button.clicked.connect(self.play_selected_sound)
+        self.sound_stop_button.clicked.connect(self.stop_sound)
+        self.sound_extract_button.clicked.connect(self.extract_selected_sound)
+        self.sound_extract_all_button.clicked.connect(self.extract_all_sounds)
+        for button in (self.sound_play_button, self.sound_stop_button, self.sound_extract_button, self.sound_extract_all_button):
+            button.setEnabled(False)
+            sound_buttons.addWidget(button)
+        sound_layout.addLayout(sound_buttons)
+        self.sound_tab = sound_tab
+        self.tabs.addTab(sound_tab, "Sounds")
+
         export_tab = QWidget()
         export_layout = QVBoxLayout(export_tab)
         export_layout.addWidget(QLabel("Source extraction pipeline"))
@@ -497,6 +558,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Layout reset", 3000)
 
     def closeEvent(self, event) -> None:
+        self.stop_sound()
         self.ui_sounds.play_window_close()
         self.settings["root_split_sizes"] = self.root_split.sizes()
         self.settings["center_split_sizes"] = self.center_split.sizes()
@@ -519,6 +581,7 @@ class MainWindow(QMainWindow):
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             self.entries = build_library(directory, self.id_lists)
+            self.entries.extend(build_cac_entries(directory, self.cac_profiles, self.id_lists))
         except OSError as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not scan the directory:\n{exc}")
             return
@@ -528,15 +591,57 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.path_label.setText(f" {directory} ")
         self.populate_tree()
-        self.statusBar().showMessage(f"Indexed {len(self.entries)} folders", 5000)
+        cac_count = sum(1 for entry in self.entries if entry.category == "CaC")
+        suffix = f" including {cac_count} imported CaC(s)" if cac_count else ""
+        self.statusBar().showMessage(f"Indexed {len(self.entries)} folders{suffix}", 5000)
+
+    def import_cac_save_xml(self) -> None:
+        start = self.settings.get("cac_xml_directory") or self.settings.get("asset_directory") or str(self.project_root)
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Xenoverse 2 save XML",
+            str(start),
+            "Xenoverse Save XML (*.xml);;XML files (*.xml);;All files (*.*)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            profiles = parse_save_xml(path)
+        except (OSError, ValueError, Exception) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not import the save XML:\n{exc}")
+            return
+        if not profiles:
+            QMessageBox.information(self, APP_NAME, "No CaC characters were found in that XML.")
+            return
+        self.cac_profiles = profiles
+        save_profiles(self.cac_store_path, profiles)
+        self.settings["cac_xml_directory"] = str(path.parent)
+        save_settings(self.settings)
+        current = self.settings.get("asset_directory")
+        if current and Path(current).is_dir():
+            self.load_directory(Path(current))
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            f"Imported {len(profiles)} CaC character(s).\n\n"
+            f"They are stored in:\n{self.cac_store_path}",
+        )
 
     def refresh(self) -> None:
         current = self.settings.get("asset_directory")
         if current and Path(current).is_dir():
             self.id_lists = load_all_id_lists(self.id_dir)
+            self.cac_profiles = load_profiles(self.cac_store_path)
             self.load_directory(Path(current))
 
     def populate_tree(self) -> None:
+        # Building the tree must remain cheap. Portrait EMBs are decoded later in
+        # tiny event-loop batches so hundreds of portraits cannot block startup.
+        self._portrait_generation += 1
+        generation = self._portrait_generation
+        self._portrait_batch_timer.stop()
+        self._portrait_queue.clear()
         self.tree.clear()
         groups: dict[str, QTreeWidgetItem] = {}
         for index, entry in enumerate(self.entries):
@@ -550,10 +655,37 @@ class MainWindow(QMainWindow):
             item.setData(0, Qt.UserRole, index)
             item.setToolTip(0, str(entry.path))
             item.setForeground(0, QBrush(BLUE if entry.usable is True else RED if entry.usable is False else NEUTRAL))
+            portrait_path = entry.metadata.get("portrait_emb")
+            if isinstance(portrait_path, str) and portrait_path:
+                item.setData(0, Qt.UserRole + 1, portrait_path)
+                item.setSizeHint(0, QSize(0, 46))
+                self._portrait_queue.append((item, Path(portrait_path), generation))
             parent.addChild(item)
         for parent in groups.values():
             parent.setExpanded(True)
+        self.tree.collapseAll()
         self.apply_filter(self.search.text())
+        if self._portrait_queue:
+            self._portrait_batch_timer.start(0)
+
+    def _process_portrait_batch(self) -> None:
+        """Decode a few portrait EMBs without freezing the Qt event loop."""
+        generation = self._portrait_generation
+        processed = 0
+        while self._portrait_queue and processed < 2:
+            item, path, queued_generation = self._portrait_queue.pop(0)
+            if queued_generation != generation:
+                continue
+            # Items may have been destroyed by a refresh before this timer fires.
+            try:
+                icon = self._portrait_icon(path)
+                if not icon.isNull():
+                    item.setIcon(0, icon)
+            except RuntimeError:
+                pass
+            processed += 1
+        if self._portrait_queue:
+            self._portrait_batch_timer.start(15)
 
     def apply_filter(self, text: str) -> None:
         query = text.strip().casefold()
@@ -581,11 +713,238 @@ class MainWindow(QMainWindow):
         if entry.category.startswith("Skills"):
             self.append_skill_entry(entry)
             return
+        if entry.category.startswith("Sounds") or bool(entry.metadata.get("sound_bank")):
+            self.load_sound_entry(entry)
+            return
         self.show_entry(entry)
 
+    def _portrait_icon(self, emb_path: Path) -> QIcon:
+        key = str(emb_path.resolve())
+        cached = self.portrait_cache.get(key)
+        if cached is not None:
+            return cached
+        icon = QIcon()
+        try:
+            emb = load_emb(emb_path)
+            candidates = []
+            for embedded in emb.entries:
+                image = embedded.to_qimage()
+                if image is None or image.width() <= 0 or image.height() <= 0:
+                    continue
+                area = image.width() * image.height()
+                square_bias = min(image.width(), image.height()) / max(image.width(), image.height())
+                candidates.append((area * (0.65 + 0.35 * square_bias), image))
+            if candidates:
+                image = max(candidates, key=lambda pair: pair[0])[1]
+                pixmap = QPixmap.fromImage(image).scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                icon = QIcon(pixmap)
+        except (OSError, EmbFormatError):
+            pass
+        self.portrait_cache[key] = icon
+        return icon
+
+    def _clear_sound_state(self, clear_list: bool = True) -> None:
+        """Release audio/metadata state held by the previously opened bank."""
+        self._sound_metadata_generation += 1
+        self._sound_metadata_timer.stop()
+        self._sound_metadata_index = 0
+        self.sound_player.stop()
+        self.sound_player.setSource(QUrl())
+        self.current_sound_bank = None
+        self.current_sound_entry = None
+        if clear_list:
+            self.sound_list.clear()
+            self.sound_meta.setText("Select an ACB sound bank from the library.")
+        for button in (self.sound_play_button, self.sound_stop_button, self.sound_extract_button, self.sound_extract_all_button):
+            button.setEnabled(False)
+
+    def _release_loaded_asset_state(self) -> None:
+        """Drop parsed files, previews and GPU-backed viewport data from the prior asset."""
+        self.animation_timer.stop()
+        self.current_ean = None
+        self.face_ean = None
+        self.lip_ean = None
+        self.camera_ean = None
+        self.current_animation = None
+        self.current_emm = None
+        self.current_emb = None
+        self.animation_sources.clear()
+        self.texture_preview.setPixmap(QPixmap())
+        self.texture_preview.setText("No texture selected")
+        self.texture_list.clear()
+        self.material_tree.clear()
+        self.parameter_table.setRowCount(0)
+        self.skeleton_tree.clear()
+        self.viewport.clear()
+        # Qt/Python may otherwise wait for a later collection cycle before
+        # releasing large QImages and parser object graphs.
+        gc.collect()
+
+    def load_sound_entry(self, entry: LibraryEntry) -> None:
+        self._clear_sound_state(clear_list=True)
+        acb_text = entry.metadata.get("acb_path")
+        acb_path = Path(acb_text) if isinstance(acb_text, str) and acb_text else next((a.path for a in entry.assets if a.kind == AssetKind.SOUND_BANK), None)
+        if acb_path is None:
+            return
+        self.current_sound_entry = entry
+        self.sound_meta.setText(f"Reading {acb_path.name}…")
+        self.tabs.setCurrentWidget(self.sound_tab)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            bank = inspect_sound_bank(acb_path, self.project_root)
+        except (OSError, SoundToolError) as exc:
+            self.sound_meta.setText(f"Could not open {acb_path.name}: {exc}")
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.current_sound_bank = bank
+        self._sound_metadata_generation += 1
+        self._sound_metadata_index = 0
+        self._sound_metadata_timer.stop()
+        for stream in bank.streams:
+            item = QListWidgetItem(f"{stream.index:04d}  {stream.name}")
+            item.setData(Qt.UserRole, stream.index)
+            self.sound_list.addItem(item)
+        awb_text = bank.awb_path.name if bank.awb_path else "embedded/no matching AWB"
+        self.sound_meta.setText(f"{bank.acb_path.name} • {len(bank.streams)} sounds • AWB: {awb_text} • Output: 44,100 Hz WAV")
+        enabled = bool(bank.streams)
+        for button in (self.sound_play_button, self.sound_extract_button, self.sound_extract_all_button):
+            button.setEnabled(enabled)
+        self.sound_stop_button.setEnabled(False)
+        if enabled:
+            # Metadata is resolved only for the selected sound (and during an
+            # explicit Extract All). Spawning one vgmstream process per cue in
+            # the background can consume enormous memory on large ACB/AWB banks.
+            self.sound_list.setCurrentRow(0)
+
+    def _load_next_sound_metadata(self) -> None:
+        bank = self.current_sound_bank
+        if bank is None or self._sound_metadata_index >= len(bank.streams):
+            return
+        row = self._sound_metadata_index
+        self._sound_metadata_index += 1
+        stream = bank.streams[row]
+        try:
+            detailed = read_stream_metadata(bank, stream)
+            bank.streams[row] = detailed
+            item = self.sound_list.item(row)
+            if item is not None:
+                item.setText(f"{detailed.index:04d}  {detailed.name}")
+        except (OSError, SoundToolError):
+            pass
+        if self.current_sound_bank is bank and self._sound_metadata_index < len(bank.streams):
+            self._sound_metadata_timer.start(0)
+
+    def _selected_sound_stream(self) -> SoundStream | None:
+        bank = self.current_sound_bank
+        row = self.sound_list.currentRow()
+        if bank is None or not 0 <= row < len(bank.streams):
+            return None
+        return bank.streams[row]
+
+    def sound_stream_selected(self, row: int) -> None:
+        bank = self.current_sound_bank
+        if bank is None or not 0 <= row < len(bank.streams):
+            return
+        stream = bank.streams[row]
+        try:
+            detailed = read_stream_metadata(bank, stream)
+            bank.streams[row] = detailed
+            item = self.sound_list.item(row)
+            if item is not None:
+                item.setText(f"{detailed.index:04d}  {detailed.name}")
+            details = []
+            if detailed.title:
+                details.append(f"Title: {detailed.title}")
+            if detailed.artist:
+                details.append(f"Artist: {detailed.artist}")
+            if detailed.sample_rate:
+                details.append(f"{detailed.sample_rate:,} Hz")
+            if detailed.channels:
+                details.append(f"{detailed.channels} ch")
+            if detailed.samples and detailed.sample_rate:
+                details.append(f"{detailed.samples / detailed.sample_rate:.2f} sec")
+            base = f"{bank.acb_path.name} • Sound {detailed.index}/{len(bank.streams)}"
+            self.sound_meta.setText(base + (" • " + " • ".join(details) if details else ""))
+        except (OSError, SoundToolError):
+            pass
+
+    def play_selected_sound(self) -> None:
+        bank = self.current_sound_bank
+        stream = self._selected_sound_stream()
+        if bank is None or stream is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            wav_path = decode_stream_to_temp(bank, stream.index)
+        except (OSError, SoundToolError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not decode sound:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.sound_player.stop()
+        self.sound_player.setSource(QUrl())
+        self.sound_player.setSource(QUrl.fromLocalFile(str(wav_path)))
+        self.sound_player.play()
+        self.sound_stop_button.setEnabled(True)
+        self.statusBar().showMessage(f"Playing {stream.name}", 5000)
+
+    def stop_sound(self) -> None:
+        self.sound_player.stop()
+        self.sound_player.setSource(QUrl())
+        if hasattr(self, "sound_stop_button"):
+            self.sound_stop_button.setEnabled(False)
+
+    def extract_selected_sound(self) -> None:
+        bank = self.current_sound_bank
+        stream = self._selected_sound_stream()
+        if bank is None or stream is None:
+            return
+        try:
+            stream = read_stream_metadata(bank, stream)
+            bank.streams[self.sound_list.currentRow()] = stream
+        except (OSError, SoundToolError):
+            pass
+        default_name = f"{stream.index:04d}_{safe_stream_filename(stream)}.wav"
+        output, _filter = QFileDialog.getSaveFileName(self, "Extract sound as WAV", default_name, "WAV audio (*.wav)")
+        if not output:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            decode_stream(bank, stream.index, Path(output), 44100)
+        except (OSError, SoundToolError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not extract sound:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"Extracted {Path(output).name}", 7000)
+
+    def extract_all_sounds(self) -> None:
+        bank = self.current_sound_bank
+        if bank is None:
+            return
+        output = QFileDialog.getExistingDirectory(self, "Choose sound extraction directory", str(bank.acb_path.parent))
+        if not output:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            def report(current: int, total: int, name: str) -> None:
+                self.statusBar().showMessage(f"Extracting {name} ({current}/{total})")
+                QApplication.processEvents()
+            files = extract_all_streams(bank, Path(output) / bank.acb_path.stem, report)
+        except (OSError, SoundToolError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not extract bank:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, APP_NAME, f"Extracted {len(files)} sounds as 44,100 Hz WAV files.")
+
     def show_entry(self, entry: LibraryEntry) -> None:
+        self._clear_sound_state(clear_list=True)
+        self._release_loaded_asset_state()
         self.current_entry = entry
-        if entry.category == "Characters":
+        if entry.category in {"Characters", "CaC"}:
             self.current_character_entry = entry
             self.additional_animation_entries.clear()
             self.additional_animation_paths.clear()
@@ -593,7 +952,16 @@ class MainWindow(QMainWindow):
             self.animation_sources.clear()
         self.character_title.setText(entry.label)
         status = "Playable / usable" if entry.usable is True else "Non-usable" if entry.usable is False else "Unknown availability"
-        self.character_meta.setText(f"{entry.category} • {status} • {summarize_assets(entry.assets)}\n{entry.path}")
+        if entry.category == "CaC":
+            profile = entry.metadata.get("cac_profile", {})
+            race_name = entry.metadata.get("race_name", entry.metadata.get("race", "Unknown race"))
+            level = profile.get("level", "?") if isinstance(profile, dict) else "?"
+            preset = entry.metadata.get("preset_index", 0)
+            self.character_meta.setText(
+                f"CaC • {race_name} • Level {level} • Preset {int(preset) + 1} • {summarize_assets(entry.assets)}\n{entry.path}"
+            )
+        else:
+            self.character_meta.setText(f"{entry.category} • {status} • {summarize_assets(entry.assets)}\n{entry.path}")
         self.asset_list.clear()
         self.animation_timer.stop()
         self.current_ean = None
@@ -619,7 +987,6 @@ class MainWindow(QMainWindow):
         self.model_list.blockSignals(True)
         self.model_list.clear()
         self.model_list.blockSignals(False)
-        self.viewport.clear()
         for asset in entry.assets:
             item = QListWidgetItem(f"{asset.kind.value:18}  {asset.path.name}")
             item.setToolTip(str(asset.path))
@@ -636,22 +1003,56 @@ class MainWindow(QMainWindow):
         self.populate_assignments(entry)
         self.extract_button.setEnabled(True)
         if self.model_list.count():
-            self.model_list.item(0).setCheckState(Qt.Checked)
-        main_skeleton = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON and a.path.stem.casefold() == f"{entry.code}_000".casefold()), None)
+            if entry.category == "CaC":
+                self.set_all_models_checked(True)
+            else:
+                self.model_list.item(0).setCheckState(Qt.Checked)
+
+        race = str(entry.metadata.get("race", entry.code))
+        explicit_skeleton = str(entry.metadata.get("main_skeleton", ""))
+        main_skeleton = Path(explicit_skeleton) if explicit_skeleton and Path(explicit_skeleton).is_file() else None
+        if main_skeleton is None:
+            main_skeleton = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON and a.path.stem.casefold() == f"{race}_000".casefold()), None)
         if main_skeleton:
             self.load_skeleton_to_viewport(main_skeleton, switch_tab=False)
-        main_animation = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION and a.path.name.casefold() == f"{entry.code}.ean".casefold()), None)
+
+        explicit_animation = str(entry.metadata.get("main_animation", ""))
+        main_animation = Path(explicit_animation) if explicit_animation and Path(explicit_animation).is_file() else None
+        if main_animation is None:
+            main_animation = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION and a.path.name.casefold() == f"{race}.ean".casefold()), None)
         if main_animation is None:
             main_animation = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION), None)
-        face_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{entry.code}.fce.ean".casefold()), None)
-        lip_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{entry.code}.fce.lip.ean".casefold()), None)
-        camera_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{entry.code}.cam.ean".casefold()), None)
+        face_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{race}.fce.ean".casefold()), None)
+        lip_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{race}.fce.lip.ean".casefold()), None)
+        camera_path = next((a.path for a in entry.assets if a.path.name.casefold() == f"{race}.cam.ean".casefold()), None)
         self.face_ean = self._try_load_aux_ean(face_path)
         self.lip_ean = self._try_load_aux_ean(lip_path)
         self.camera_ean = self._try_load_aux_ean(camera_path)
         self.populate_aux_animation_combos()
         if main_animation:
             self.load_animation_file(main_animation, switch_tab=False)
+
+        if entry.category == "CaC":
+            skill_entries = resolve_skill_entries(entry.metadata_to_profile() if hasattr(entry, "metadata_to_profile") else self._profile_for_cac_entry(entry), self.entries, self.id_lists)
+            self.additional_animation_entries = skill_entries
+            self.additional_animation_paths = {asset.path.resolve() for skill in skill_entries for asset in skill.assets if asset.kind in (AssetKind.ANIMATION, AssetKind.CAMERA)}
+            self.additional_camera_sources.clear()
+            for skill in skill_entries:
+                for asset in skill.assets:
+                    if asset.kind != AssetKind.CAMERA:
+                        continue
+                    try:
+                        ean = load_ean(asset.path)
+                    except (OSError, EanFormatError):
+                        continue
+                    for animation in ean.animations:
+                        self.additional_camera_sources.append((ean, animation, skill.code, asset.path))
+            self._rebuild_animation_list(select_first=False)
+            self._rebuild_camera_combo()
+
+    def _profile_for_cac_entry(self, entry: LibraryEntry):
+        slot = int(entry.metadata.get("cac_slot", -1))
+        return next((profile for profile in self.cac_profiles if profile.slot == slot), self.cac_profiles[0] if self.cac_profiles else None)
 
     def _rebuild_animation_list(self, select_first: bool = False) -> None:
         """Rebuild the visible animation list from the character and appended skills."""
@@ -695,7 +1096,7 @@ class MainWindow(QMainWindow):
 
     def append_skill_entry(self, entry: LibraryEntry) -> None:
         """Append body and camera EANs from a skill without replacing prior sets."""
-        if self.current_character_entry is None or self.current_entry is None or self.current_entry.category != "Characters":
+        if self.current_character_entry is None or self.current_entry is None or self.current_entry.category not in {"Characters", "CaC"}:
             QMessageBox.information(self, APP_NAME, "Load a character before appending skill animations.")
             return
 
@@ -1049,7 +1450,9 @@ class MainWindow(QMainWindow):
             return
         self.current_ean = ean
         self.current_animation = None
-        self._rebuild_animation_list(select_first=True)
+        # Loading a character should not silently start a 60 FPS animation.
+        # Manual animation clicks still auto-play through animation_selection_changed().
+        self._rebuild_animation_list(select_first=switch_tab)
         version = ".".join(str(part) for part in ean.version)
         self.animation_meta.setText(
             f"{path.name} • {len(ean.animations)} base animations • Version {version} • 60 FPS native playback"

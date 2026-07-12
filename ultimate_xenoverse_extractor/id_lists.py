@@ -106,6 +106,8 @@ def parse_id_file(path: Path) -> list[IdRecord]:
         "ID1 (Long)",
         "ID1 Long",
         "ID Long",
+        "ID",
+        "Model ID",
     )
     if primary_id_i is None:
         primary_id_i = _column_contains(headers, "id", "num")

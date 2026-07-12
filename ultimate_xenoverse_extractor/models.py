@@ -16,6 +16,8 @@ class AssetKind(str, Enum):
     LIP_ANIMATION = "Lip Animation"
     CONFIG = "Configuration"
     GAMEPLAY = "Gameplay Data"
+    SOUND_BANK = "Sound Bank"
+    AUDIO_ARCHIVE = "Audio Archive"
     OTHER = "Other"
 
 
@@ -49,7 +51,10 @@ class LibraryEntry:
     usable: bool | None = None
     id_record: IdRecord | None = None
     assets: list[AssetFile] = field(default_factory=list)
+    metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
+        if self.category == "CaC" or bool(self.metadata.get("cac")):
+            return self.display_name
         return f"{self.display_name} [{self.code}]" if self.display_name != self.code else self.code

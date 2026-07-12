@@ -22,12 +22,19 @@ class EanTrack:
     flag: int
     unknown: int
     keyframes: list[EanKeyframe] = field(default_factory=list)
+    _frames: tuple[int, ...] = field(init=False, repr=False, default=())
+
+    def __post_init__(self) -> None:
+        # Sampling happens once per animated channel per viewport frame. Building
+        # a new list of frame indices on every sample caused enormous temporary
+        # allocation churn, which Windows retained in the process heap after each
+        # completed animation loop. Cache the immutable search keys once instead.
+        self._frames = tuple(key.frame for key in self.keyframes)
 
     def sample(self, frame: float, normalize_quaternion: bool = False) -> tuple[float, float, float, float] | None:
         if not self.keyframes:
             return None
-        frames = [key.frame for key in self.keyframes]
-        upper = bisect.bisect_left(frames, frame)
+        upper = bisect.bisect_left(self._frames, frame)
         if upper <= 0:
             value = self.keyframes[0].value
         elif upper >= len(self.keyframes):
@@ -60,14 +67,23 @@ class EanAnimation:
     frame_index_size: int
     frame_float_size: int
     nodes: list[EanNode]
+    _node_map: dict[int, EanNode] = field(init=False, repr=False, default_factory=dict)
+    _node_name_map: dict[str, EanNode] = field(init=False, repr=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # These maps are read every frame by the viewport. They are animation
+        # metadata, not frame data, so constructing fresh dictionaries sixty
+        # times per second only creates garbage and grows the native allocator.
+        self._node_map = {node.bone_index: node for node in self.nodes}
+        self._node_name_map = {node.bone_name: node for node in self.nodes if node.bone_name}
 
     @property
     def node_map(self) -> dict[int, EanNode]:
-        return {node.bone_index: node for node in self.nodes}
+        return self._node_map
 
     @property
     def node_name_map(self) -> dict[str, EanNode]:
-        return {node.bone_name: node for node in self.nodes if node.bone_name}
+        return self._node_name_map
 
 
 @dataclass(slots=True)

@@ -665,11 +665,16 @@ def export_character(
     additional_entries: list[LibraryEntry] | None = None,
 ) -> ExportResult:
     additional_entries = additional_entries or []
-    output_dir = Path(output_root) / _safe_name(entry.code)
+    export_name = str(entry.metadata.get("export_name", entry.code))
+    output_dir = Path(output_root) / _safe_name(export_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     result = ExportResult(output_dir)
 
-    skeleton_asset = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON and a.path.stem.casefold() == f"{entry.code}_000".casefold()), None)
+    explicit_skeleton = str(entry.metadata.get("main_skeleton", ""))
+    skeleton_asset = Path(explicit_skeleton) if explicit_skeleton and Path(explicit_skeleton).is_file() else None
+    race_code = str(entry.metadata.get("race", entry.code))
+    if skeleton_asset is None:
+        skeleton_asset = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON and a.path.stem.casefold() == f"{race_code}_000".casefold()), None)
     if skeleton_asset is None:
         skeleton_asset = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON), None)
     if skeleton_asset is None:
@@ -693,7 +698,10 @@ def export_character(
 
     esk, secondary_maps = _build_combined_skeleton(main_esk, list(secondary_unique.values()))
 
-    main_ean_path = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION and a.path.name.casefold() == f"{entry.code}.ean".casefold()), None)
+    explicit_animation = str(entry.metadata.get("main_animation", ""))
+    main_ean_path = Path(explicit_animation) if explicit_animation and Path(explicit_animation).is_file() else None
+    if main_ean_path is None:
+        main_ean_path = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION and a.path.name.casefold() == f"{race_code}.ean".casefold()), None)
     if main_ean_path is None:
         main_ean_path = next((a.path for a in entry.assets if a.kind == AssetKind.ANIMATION and ".fce." not in a.path.name.casefold() and ".cam." not in a.path.name.casefold()), None)
     ean = load_ean(main_ean_path) if main_ean_path else None
@@ -857,6 +865,9 @@ def export_character(
     summary = {
         "exporter_version": EXPORTER_VERSION,
         "character": entry.code,
+        "display_name": entry.display_name,
+        "is_cac": bool(entry.metadata.get("cac")),
+        "cac_profile": entry.metadata.get("cac_profile") if entry.metadata.get("cac") else None,
         "additional_animation_sets": [
             {"code": extra.code, "path": str(extra.path)} for extra in additional_entries
         ],

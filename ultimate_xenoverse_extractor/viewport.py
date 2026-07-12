@@ -199,10 +199,13 @@ class ModelViewport(QOpenGLWidget):
         self.line_vbo = None
         self.line_vao = None
         self.white_texture = None
-        self.bone_texture = None
-        self._bone_texture_height = 0
+        self.bone_buffer = None
+        self._bone_buffer_capacity = 256
         self._bone_texture_data: np.ndarray | None = None
         self._bone_texture_dirty = True
+        self._inverse_bind_matrices: np.ndarray | None = None
+        self._skin_matrix_buffer: np.ndarray | None = None
+        self._bone_upload_buffer: np.ndarray | None = None
         self._gl_ready = False
         self._gpu_error: str | None = None
         self._qt_framebuffer = None
@@ -225,17 +228,14 @@ class ModelViewport(QOpenGLWidget):
                     in vec4 in_bone_weights;
                     uniform mat4 u_mvp;
                     uniform vec2 u_uv_scale;
-                    uniform sampler2D u_bone_matrices;
                     uniform bool u_use_skinning;
+                    layout(std140) uniform BoneMatrices {
+                        mat4 u_bones[256];
+                    };
                     out vec2 v_uv;
 
                     mat4 fetch_bone_matrix(int bone_index) {
-                        return mat4(
-                            texelFetch(u_bone_matrices, ivec2(0, bone_index), 0),
-                            texelFetch(u_bone_matrices, ivec2(1, bone_index), 0),
-                            texelFetch(u_bone_matrices, ivec2(2, bone_index), 0),
-                            texelFetch(u_bone_matrices, ivec2(3, bone_index), 0)
-                        );
+                        return u_bones[clamp(bone_index, 0, 255)];
                     }
 
                     void main() {
@@ -292,7 +292,7 @@ class ModelViewport(QOpenGLWidget):
             self.line_vao = self.ctx.simple_vertex_array(self.line_program, self.line_vbo, "in_position")
             self.white_texture = self.ctx.texture((1, 1), 4, bytes((255, 255, 255, 255)))
             self.white_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self._ensure_bone_texture(max(1, len(self._pose_positions)))
+            self._ensure_bone_buffer()
             # QOpenGLWidget renders into an internal framebuffer rather than
             # OpenGL framebuffer 0. ModernGL must explicitly target that FBO.
             self._bind_qt_framebuffer(force=True)
@@ -342,7 +342,7 @@ class ModelViewport(QOpenGLWidget):
         self.ctx.viewport = (0, 0, max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio)))
         self.ctx.enable(moderngl.DEPTH_TEST | moderngl.BLEND)
         self.ctx.clear(0.035, 0.045, 0.058, 1.0, depth=1.0)
-        self._upload_bone_texture_if_needed()
+        self._upload_bone_buffer_if_needed()
         mvp = self._mvp_matrix()
 
         if self.show_grid:
@@ -362,6 +362,41 @@ class ModelViewport(QOpenGLWidget):
             except Exception:
                 pass
         surface.gpu = GpuSurface()
+
+    def _dispose_part(self, part: RenderPart) -> None:
+        """Release both OpenGL objects and large CPU-side mesh/image buffers."""
+        for surface in part.surfaces:
+            self._release_surface_gpu(surface)
+            surface.texture = None
+            surface.vertices.clear()
+            surface.triangles.clear()
+            if surface.uvs is not None:
+                surface.uvs.clear()
+            if surface.bind_vertices is not None:
+                surface.bind_vertices.clear()
+            if surface.blend_indices is not None:
+                surface.blend_indices.clear()
+            if surface.blend_weights is not None:
+                surface.blend_weights.clear()
+            if surface.bone_palette_names is not None:
+                surface.bone_palette_names.clear()
+            if surface.resolved_bones is not None:
+                surface.resolved_bones.clear()
+        part.surfaces.clear()
+
+    def _flush_gpu_releases(self) -> None:
+        if self.ctx is None:
+            return
+        try:
+            self.ctx.finish()
+        except Exception:
+            pass
+        try:
+            collect = getattr(self.ctx, "gc", None)
+            if callable(collect):
+                collect()
+        except Exception:
+            pass
 
     def _upload_all_surfaces(self) -> None:
         if not self._gl_ready:
@@ -445,8 +480,8 @@ class ModelViewport(QOpenGLWidget):
         if self._gl_ready:
             self.makeCurrent()
             for part in self.parts.values():
-                for surface in part.surfaces:
-                    self._release_surface_gpu(surface)
+                self._dispose_part(part)
+            self._flush_gpu_releases()
             self.doneCurrent()
         self.parts.clear()
         self.current_esk = None
@@ -466,6 +501,15 @@ class ModelViewport(QOpenGLWidget):
         self._pose_scales.clear()
         self._bone_texture_data = None
         self._bone_texture_dirty = True
+        if self.bone_buffer is not None:
+            try:
+                self.bone_buffer.release()
+            except Exception:
+                pass
+            self.bone_buffer = None
+        self._inverse_bind_matrices = None
+        self._skin_matrix_buffer = None
+        self._bone_upload_buffer = None
         self.update()
         self.statusChanged.emit("Viewport cleared")
 
@@ -524,8 +568,8 @@ class ModelViewport(QOpenGLWidget):
         old = self.parts.pop(key, None)
         if old is not None and self._gl_ready:
             self.makeCurrent()
-            for surface in old.surfaces:
-                self._release_surface_gpu(surface)
+            self._dispose_part(old)
+            self._flush_gpu_releases()
             self.doneCurrent()
         self.parts[key] = RenderPart(key, surfaces)
         self._resolve_surface_bones()
@@ -560,11 +604,14 @@ class ModelViewport(QOpenGLWidget):
 
     def remove_part(self, key: str) -> None:
         part = self.parts.pop(key, None)
-        if part is not None and self._gl_ready:
-            self.makeCurrent()
-            for surface in part.surfaces:
-                self._release_surface_gpu(surface)
-            self.doneCurrent()
+        if part is not None:
+            if self._gl_ready:
+                self.makeCurrent()
+                self._dispose_part(part)
+                self._flush_gpu_releases()
+                self.doneCurrent()
+            else:
+                self._dispose_part(part)
         self.fit_scene()
 
     def set_part_visible(self, key: str, visible: bool) -> None:
@@ -647,6 +694,19 @@ class ModelViewport(QOpenGLWidget):
                 scales[bone.index] = tuple(parent_scale[i] * local_scale[i] for i in range(3))
         self._bind_positions, self._bind_rotations, self._bind_scales = positions, rotations, scales
 
+        # Bind transforms never change for a loaded skeleton. Inverting every
+        # bind matrix on every animation frame was both expensive and extremely
+        # allocation-heavy. Build and retain the inverse matrices exactly once.
+        self._inverse_bind_matrices = np.empty((count, 4, 4), dtype=np.float32)
+        for index in range(count):
+            bind = self._transform_matrix(positions[index], rotations[index], scales[index])
+            try:
+                self._inverse_bind_matrices[index] = np.linalg.inv(bind)
+            except np.linalg.LinAlgError:
+                self._inverse_bind_matrices[index] = np.eye(4, dtype=np.float32)
+        self._skin_matrix_buffer = np.empty((count, 4, 4), dtype=np.float32)
+        self._bone_upload_buffer = np.empty((count, 4, 4), dtype=np.float32)
+
     def _resolve_surface_bones(self) -> None:
         if self.current_esk is None:
             return
@@ -690,56 +750,72 @@ class ModelViewport(QOpenGLWidget):
     def _build_skin_matrices(self) -> np.ndarray:
         count = min(len(self._bind_positions), len(self._pose_positions))
         if count <= 0:
-            return np.eye(4, dtype=np.float32)[None, ...]
-        matrices = np.empty((count, 4, 4), dtype=np.float32)
+            if self._skin_matrix_buffer is None or self._skin_matrix_buffer.shape[0] != 1:
+                self._skin_matrix_buffer = np.eye(4, dtype=np.float32)[None, ...]
+            return self._skin_matrix_buffer
+
+        if self._skin_matrix_buffer is None or self._skin_matrix_buffer.shape != (count, 4, 4):
+            self._skin_matrix_buffer = np.empty((count, 4, 4), dtype=np.float32)
+        if self._inverse_bind_matrices is None or self._inverse_bind_matrices.shape[0] < count:
+            # Defensive fallback for a skeleton supplied by an older code path.
+            self._inverse_bind_matrices = np.empty((count, 4, 4), dtype=np.float32)
+            for index in range(count):
+                bind = self._transform_matrix(
+                    self._bind_positions[index], self._bind_rotations[index], self._bind_scales[index]
+                )
+                try:
+                    self._inverse_bind_matrices[index] = np.linalg.inv(bind)
+                except np.linalg.LinAlgError:
+                    self._inverse_bind_matrices[index] = np.eye(4, dtype=np.float32)
+
+        out = self._skin_matrix_buffer
         for index in range(count):
-            bind = self._transform_matrix(
-                self._bind_positions[index], self._bind_rotations[index], self._bind_scales[index]
-            )
             pose = self._transform_matrix(
                 self._pose_positions[index], self._pose_rotations[index], self._pose_scales[index]
             )
-            try:
-                matrices[index] = pose @ np.linalg.inv(bind)
-            except np.linalg.LinAlgError:
-                matrices[index] = np.eye(4, dtype=np.float32)
-        return matrices
+            # matmul's out parameter avoids creating a new 4x4 result per bone.
+            np.matmul(pose, self._inverse_bind_matrices[index], out=out[index])
+        return out
 
-    def _ensure_bone_texture(self, bone_count: int) -> None:
-        if not self._gl_ready and self.ctx is None:
-            return
-        if self.ctx is None:
-            return
-        height = max(1, int(bone_count))
-        if self.bone_texture is not None and self._bone_texture_height == height:
-            return
-        if self.bone_texture is not None:
-            try:
-                self.bone_texture.release()
-            except Exception:
-                pass
-        identity = np.eye(4, dtype=np.float32)[None, ...]
-        initial = np.repeat(identity, height, axis=0)
-        # Texture layout is [bone, matrix-column, column-components].
-        packed = np.transpose(initial, (0, 2, 1)).copy()
-        self.bone_texture = self.ctx.texture((4, height), 4, packed.tobytes(), dtype="f4")
-        self.bone_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.bone_texture.repeat_x = False
-        self.bone_texture.repeat_y = False
-        self._bone_texture_height = height
-        self._bone_texture_dirty = True
+    def _ensure_bone_buffer(self) -> None:
+        """Create one persistent UBO for all skin matrices.
 
-    def _upload_bone_texture_if_needed(self) -> None:
+        A texture upload every frame caused the Windows OpenGL driver to retain
+        staging allocations in the Python process working set.  A persistently
+        allocated uniform buffer avoids that path entirely.
+        """
+        if self.ctx is None or self.bone_buffer is not None:
+            return
+        self.bone_buffer = self.ctx.buffer(
+            reserve=self._bone_buffer_capacity * 16 * 4,
+            dynamic=True,
+        )
+        self.bone_buffer.bind_to_uniform_block(0)
+        try:
+            self.mesh_program["BoneMatrices"].binding = 0
+        except Exception:
+            pass
+
+    def _upload_bone_buffer_if_needed(self) -> None:
         if not self._bone_texture_dirty or self.ctx is None:
             return
         matrices = self._bone_texture_data
         if matrices is None:
             matrices = self._build_skin_matrices()
-        self._ensure_bone_texture(len(matrices))
-        if self.bone_texture is None:
+        self._ensure_bone_buffer()
+        if self.bone_buffer is None:
             return
-        packed = np.transpose(matrices.astype(np.float32, copy=False), (0, 2, 1)).copy()
-        self.bone_texture.write(packed.tobytes())
+        count = min(len(matrices), self._bone_buffer_capacity)
+        # GLSL mat4/std140 expects column-major matrices. Keep a reusable,
+        # contiguous array and write directly without creating a bytes object.
+        if self._bone_upload_buffer is None or self._bone_upload_buffer.shape != (self._bone_buffer_capacity, 4, 4):
+            self._bone_upload_buffer = np.zeros(
+                (self._bone_buffer_capacity, 4, 4), dtype=np.float32
+            )
+            for i in range(self._bone_buffer_capacity):
+                self._bone_upload_buffer[i] = np.eye(4, dtype=np.float32)
+        self._bone_upload_buffer[:count] = np.transpose(matrices[:count], (0, 2, 1))
+        self.bone_buffer.write(memoryview(self._bone_upload_buffer).cast("B"))
         self._bone_texture_dirty = False
 
     def _skin_meshes(self) -> None:
@@ -901,9 +977,8 @@ class ModelViewport(QOpenGLWidget):
         if self.ctx is None or self.mesh_program is None:
             return
         self._write_matrix(self.mesh_program, "u_mvp", mvp)
-        if self.bone_texture is not None:
-            self.bone_texture.use(1)
-            self.mesh_program["u_bone_matrices"].value = 1
+        if self.bone_buffer is not None:
+            self.bone_buffer.bind_to_uniform_block(0)
         for part in self.parts.values():
             if not part.visible:
                 continue

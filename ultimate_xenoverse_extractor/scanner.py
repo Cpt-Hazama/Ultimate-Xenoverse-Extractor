@@ -17,6 +17,8 @@ _EXT_KIND = {
     ".bcm": AssetKind.GAMEPLAY,
     ".bdm": AssetKind.GAMEPLAY,
     ".bai": AssetKind.GAMEPLAY,
+    ".acb": AssetKind.SOUND_BANK,
+    ".awb": AssetKind.AUDIO_ARCHIVE,
 }
 
 _CATEGORY_DIRS = {
@@ -24,6 +26,7 @@ _CATEGORY_DIRS = {
     "skill": "Skills",
     "stage": "Stages",
     "item": "Items",
+    "sound": "Sounds",
 }
 
 # data/skill subdirectory -> matching HTML ID list.
@@ -174,9 +177,102 @@ def _find_record(lookup: dict[str, IdRecord], keys: list[str]) -> IdRecord | Non
     return None
 
 
+def _resolve_data_root(selected: Path) -> Path | None:
+    selected = selected.resolve()
+    if selected.name.casefold() == "data":
+        return selected
+    direct = selected / "data"
+    if direct.is_dir():
+        return direct
+    for parent in (selected, *selected.parents):
+        if parent.name.casefold() == "data":
+            return parent
+    return None
+
+
+def _portrait_map(selected: Path) -> dict[str, Path]:
+    data_root = _resolve_data_root(selected)
+    if data_root is None:
+        return {}
+    texture_root = data_root / "ui" / "texture"
+    if not texture_root.is_dir():
+        return {}
+    portraits: dict[str, Path] = {}
+    for path in texture_root.rglob("*.emb"):
+        portraits.setdefault(path.stem.upper(), path)
+    return portraits
+
+
+def _character_sound_record(acb: Path, root: Path, all_lists: dict[str, list[IdRecord]]) -> IdRecord | None:
+    try:
+        relative_parts = [part.casefold() for part in acb.relative_to(root).parts[:-1]]
+    except ValueError:
+        relative_parts = [part.casefold() for part in acb.parts[:-1]]
+    if "chara" not in relative_parts:
+        return None
+
+    records = _records_named(all_lists, "Character IDs")
+    lookup = index_records(records)
+    tokens = [token for token in acb.stem.upper().split("_") if token]
+    ignored = {"CAR", "BTL", "VOX", "SE", "SND", "SOUND", "EN", "JP", "JPN"}
+
+    # Character banks are normally CAR_BTL_<CODE>_SE/VOX. Search from the
+    # right so the character code wins even if earlier tokens are also valid IDs.
+    for token in reversed(tokens):
+        if token in ignored:
+            continue
+        record = lookup.get(token)
+        if record is not None:
+            return record
+    return None
+
+
+def _sound_entries(root: Path, all_lists: dict[str, list[IdRecord]]) -> list[LibraryEntry]:
+    # Filename-only indexing. ACB metadata/subsongs are intentionally inspected
+    # only after the user selects a bank in the UI. Build AWB lookup once to avoid
+    # repeatedly listing the same large directories for every ACB.
+    entries: list[LibraryEntry] = []
+    all_files = [path for path in root.rglob("*") if path.is_file()]
+    acb_files = sorted(
+        (path for path in all_files if path.suffix.casefold() == ".acb"),
+        key=lambda path: str(path.relative_to(root)).casefold(),
+    )
+    awb_lookup = {
+        (path.parent.resolve(), path.stem.casefold()): path
+        for path in all_files
+        if path.suffix.casefold() == ".awb"
+    }
+    for acb in acb_files:
+        relative_parent = acb.parent.relative_to(root)
+        suffix = str(relative_parent).replace("\\", " / ").replace("/", " / ") if relative_parent.parts else "Banks"
+        category = f"Sounds / {suffix}"
+        awb = awb_lookup.get((acb.parent.resolve(), acb.stem.casefold()))
+        character_record = _character_sound_record(acb, root, all_lists)
+        display_name = character_record.name if character_record is not None else acb.stem
+        assets = [AssetFile(acb, AssetKind.SOUND_BANK, acb.stem, acb.stem.upper())]
+        if awb is not None:
+            assets.append(AssetFile(awb, AssetKind.AUDIO_ARCHIVE, awb.stem, acb.stem.upper()))
+        entries.append(
+            LibraryEntry(
+                acb.parent, category, acb.stem.upper(), display_name, None, character_record, assets,
+                {
+                    "sound_bank": True,
+                    "acb_path": str(acb),
+                    "awb_path": str(awb) if awb else "",
+                    "character_code": character_record.code if character_record is not None else "",
+                },
+            )
+        )
+    return entries
+
+
 def build_library(selected: Path, all_lists: dict[str, list[IdRecord]]) -> list[LibraryEntry]:
     entries: list[LibraryEntry] = []
+    portraits = _portrait_map(selected)
     for root, category in find_library_roots(selected):
+        if category == "Sounds":
+            entries.extend(_sound_entries(root, all_lists))
+            continue
         if category == "Skills":
             folders = sorted(
                 (
@@ -208,6 +304,11 @@ def build_library(selected: Path, all_lists: dict[str, list[IdRecord]]) -> list[
                 record = _find_record(category_lookup, [code])
 
             display = record.name if record else code
+            metadata: dict[str, object] = {}
+            if entry_category == "Characters":
+                portrait = portraits.get(code)
+                if portrait is not None:
+                    metadata["portrait_emb"] = str(portrait)
             entries.append(
                 LibraryEntry(
                     folder,
@@ -217,6 +318,7 @@ def build_library(selected: Path, all_lists: dict[str, list[IdRecord]]) -> list[
                     record.usable if record else None,
                     record,
                     scan_assets(folder),
+                    metadata,
                 )
             )
     return entries
