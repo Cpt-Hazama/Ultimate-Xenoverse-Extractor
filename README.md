@@ -16,6 +16,7 @@ Run 'install_and_run.bat' to launch the tool. It will automatically install any 
 <img width="2546" height="1300" alt="2_mdl" src="https://github.com/user-attachments/assets/8967533d-1177-4110-9cf7-131741583f77" />
 <img width="974" height="1235" alt="3_mat" src="https://github.com/user-attachments/assets/db286767-8d61-485d-b7e9-4ae006d54713" />
 <img width="1769" height="1123" alt="4_anim" src="https://github.com/user-attachments/assets/bf197247-f740-49da-aa6c-bbaf4631a213" />
+<img width="848" height="1227" alt="1" src="https://github.com/user-attachments/assets/e5888ee4-7e28-460b-bf26-abaa2ccde003" />
 
 ## Credits
 
