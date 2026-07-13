@@ -13,14 +13,15 @@ import numpy as np
 from PIL import Image
 
 from .models import AssetKind, LibraryEntry
-from .parsers import load_ean, load_emd, load_esk
+from .parsers import load_ean, load_emd, load_esk, load_bac, animation_events
 from .parsers.ean import EanAnimation, EanNode
 from .parsers.esk import EskBone, EskFile
 
 # Xenoverse assets are authored at roughly meter scale. Source character assets
 # are conventionally authored in inches/Hammer units.
-EXPORTER_VERSION = "0.1.0"
+EXPORTER_VERSION = "0.2.0"
 SOURCE_SCALE = 42.41732283464567
+OUTLINE_WIDTH = 0.001
 
 # XV2 character space: +X forward, +Y up, +Z right
 # Source/3ds Max SMD space: +X forward, +Y right, +Z up
@@ -29,6 +30,12 @@ SOURCE_SCALE = 42.41732283464567
 # was forward, which rotated exported characters 90 degrees around the up axis.
 _C = np.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), dtype=np.float64)
 _C_INV = np.linalg.inv(_C)
+
+# When an unused EXP_* container root is removed, its local transform still
+# has to be baked into b_C_Base. The registry is keyed by the stripped EskFile
+# instance so animation sampling and bind-pose calculations use the same true
+# global root orientation.
+_ROOT_CONTAINER_BAKE: dict[int, np.ndarray] = {}
 
 
 @dataclass(slots=True)
@@ -132,17 +139,65 @@ def _nodes_block(esk: EskFile) -> list[str]:
 def _skeleton_frame_lines(esk: EskFile, animation: EanAnimation | None, frame: float, scale: float) -> list[str]:
     by_name = animation.node_name_map if animation is not None else {}
     by_index = animation.node_map if animation is not None and not by_name else {}
+    root_bake = _ROOT_CONTAINER_BAKE.get(id(esk))
     lines: list[str] = []
     for bone in esk.bones:
         node = by_name.get(bone.name) if by_name else by_index.get(bone.index)
-        pos, rot, _scale = _sample_node(node, frame, bone.position, bone.rotation, bone.scale)
-        px, py, pz = _vec_source(pos, scale)
-        rx, ry, rz = _matrix_to_euler_xyz(_quat_source_matrix(rot))
+        pos, rot, sampled_scale = _sample_node(node, frame, bone.position, bone.rotation, bone.scale)
+
+        # Removing EXP_<character>_000 without preserving its transform makes
+        # b_C_Base inherit the wrong heading. Source only exposes that mistake
+        # once walkframe motion extraction is enabled, producing the observed
+        # 90-degree clockwise character rotation. Bake the removed container's
+        # complete local transform into the new true root for every frame.
+        if bone.index == 0 and root_bake is not None:
+            local = np.eye(4, dtype=np.float64)
+            local[:3, :3] = _quat_matrix(rot) @ np.diag([
+                float(sampled_scale[0]),
+                float(sampled_scale[1]),
+                float(sampled_scale[2]),
+            ])
+            local[:3, 3] = np.asarray(pos[:3], dtype=np.float64)
+            baked = root_bake @ local
+            px, py, pz = _vec_source(baked[:3, 3], scale)
+            source_rotation = _C @ baked[:3, :3] @ _C_INV
+            # Strip scale before converting the baked basis to Euler angles.
+            for column in range(3):
+                length = float(np.linalg.norm(source_rotation[:, column]))
+                if length > 1e-12:
+                    source_rotation[:, column] /= length
+            rx, ry, rz = _matrix_to_euler_xyz(source_rotation)
+        else:
+            px, py, pz = _vec_source(pos, scale)
+            rx, ry, rz = _matrix_to_euler_xyz(_quat_source_matrix(rot))
         lines.append(f"{bone.index} {px:.6f} {py:.6f} {pz:.6f} {rx:.6f} {ry:.6f} {rz:.6f}")
     return lines
 
 
-def write_reference_smd(path: Path, esk: EskFile, emd, scale: float) -> None:
+def _normalise3(v: Iterable[float]) -> tuple[float, float, float]:
+    values = tuple(float(x) for x in tuple(v)[:3])
+    length = math.sqrt(sum(x * x for x in values))
+    if length < 1e-8:
+        return (0.0, 0.0, 1.0)
+    return tuple(x / length for x in values)
+
+
+def _smd_vertex_line(parent: int, position, normal, uv, links: list[tuple[int, float]]) -> str:
+    link_text = " ".join(f"{idx} {weight:.6f}" for idx, weight in links)
+    return (
+        f"{parent} {position[0]:.6f} {position[1]:.6f} {position[2]:.6f} "
+        f"{normal[0]:.6f} {normal[1]:.6f} {normal[2]:.6f} {uv[0]:.6f} {1.0-uv[1]:.6f} "
+        f"{len(links)} {link_text}"
+    )
+
+
+def write_reference_smd(
+    path: Path,
+    esk: EskFile,
+    emd,
+    scale: float,
+    material_prefix: str = "",
+) -> None:
     bone_by_name = {bone.name: bone.index for bone in esk.bones}
     lines = ["version 1", *_nodes_block(esk), "skeleton", "time 0"]
     lines.extend(_skeleton_frame_lines(esk, None, 0.0, scale))
@@ -151,7 +206,8 @@ def write_reference_smd(path: Path, esk: EskFile, emd, scale: float) -> None:
     for model in emd.models:
         for mesh in model.meshes:
             for submesh in mesh.submeshes:
-                material = _safe_name(submesh.name, "material")
+                base_material = _safe_name(submesh.name, "material")
+                material = f"{material_prefix}_{base_material}" if material_prefix else base_material
                 positions = submesh.positions
                 normals = submesh.normals
                 uvs = submesh.uvs
@@ -159,16 +215,15 @@ def write_reference_smd(path: Path, esk: EskFile, emd, scale: float) -> None:
                     palette = [bone_by_name.get(name, 0) for name in group.bone_names]
                     indices = group.indices
                     for tri_start in range(0, len(indices) - 2, 3):
-                        # Coordinate conversion changes handedness, so reverse once.
-                        tri = (indices[tri_start], indices[tri_start + 2], indices[tri_start + 1])
-                        lines.append(material)
-                        for vi in tri:
+                        source_tri = (indices[tri_start], indices[tri_start + 1], indices[tri_start + 2])
+                        converted_tri = (source_tri[0], source_tri[2], source_tri[1])
+                        records = {}
+                        for vi in source_tri:
                             if vi >= len(positions):
                                 continue
+                            normal_xv = _normalise3(normals[vi] or (0.0, 0.0, 1.0))
                             p = _vec_source(positions[vi], scale)
-                            n = _vec_source(normals[vi] or (0.0, 0.0, 1.0), 1.0)
-                            nl = math.sqrt(sum(v*v for v in n)) or 1.0
-                            n = tuple(v / nl for v in n)
+                            n = _normalise3(_vec_source(normal_xv, 1.0))
                             uv = uvs[vi] if vi < len(uvs) and uvs[vi] is not None else (0.0, 0.0)
                             blend_i = submesh.blend_indices[vi] if vi < len(submesh.blend_indices) else None
                             blend_w = submesh.blend_weights[vi] if vi < len(submesh.blend_weights) else None
@@ -188,24 +243,125 @@ def write_reference_smd(path: Path, esk: EskFile, emd, scale: float) -> None:
                             if not links:
                                 links = [(0, 1.0)]
                             parent = max(links, key=lambda pair: pair[1])[0]
-                            link_text = " ".join(f"{idx} {weight:.6f}" for idx, weight in links)
-                            lines.append(
-                                f"{parent} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} "
-                                f"{n[0]:.6f} {n[1]:.6f} {n[2]:.6f} {uv[0]:.6f} {1.0-uv[1]:.6f} "
-                                f"{len(links)} {link_text}"
+                            outline_pos_xv = tuple(positions[vi][axis] + normal_xv[axis] * OUTLINE_WIDTH for axis in range(3))
+                            outline_p = _vec_source(outline_pos_xv, scale)
+                            outline_n = tuple(-value for value in n)
+                            records[vi] = (
+                                _smd_vertex_line(parent, p, n, uv, links),
+                                _smd_vertex_line(parent, outline_p, outline_n, uv, links),
                             )
+                        if len(records) != 3:
+                            continue
+                        lines.append(material)
+                        lines.extend(records[vi][0] for vi in converted_tri)
+                        # Reverse the converted winding again so only the shell's
+                        # back faces are visible from outside in Source.
+                        lines.append("outline")
+                        lines.extend(records[vi][1] for vi in source_tri)
     lines.append("end")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
+def write_animation_smd(
+    path: Path,
+    esk: EskFile,
+    animation: EanAnimation,
+    scale: float,
+    root_motion: tuple[float, float, float] | None = None,
+    root_offset: tuple[float, float, float] | None = None,
+) -> None:
+    """Write an animation SMD with optional bone-0 translation adjustments.
 
-def write_animation_smd(path: Path, esk: EskFile, animation: EanAnimation, scale: float) -> None:
+    ``root_offset`` is a constant Source-space offset applied to every frame.
+    ``root_motion`` is a linear displacement across the complete cycle. Neither
+    option mutates the parsed EAN animation.
+    """
     lines = ["version 1", *_nodes_block(esk), "skeleton"]
     duration = max(1, int(animation.duration))
+    denominator = max(1, duration - 1)
     for frame in range(duration):
         lines.append(f"time {frame}")
-        lines.extend(_skeleton_frame_lines(esk, animation, float(frame), scale))
+        frame_lines = _skeleton_frame_lines(esk, animation, float(frame), scale)
+        if (root_offset or root_motion) and frame_lines:
+            parts = frame_lines[0].split()
+            if len(parts) >= 7:
+                amount = frame / denominator
+                offset = root_offset or (0.0, 0.0, 0.0)
+                motion = root_motion or (0.0, 0.0, 0.0)
+                parts[1] = f"{float(parts[1]) + offset[0] + motion[0] * amount:.6f}"
+                parts[2] = f"{float(parts[2]) + offset[1] + motion[1] * amount:.6f}"
+                parts[3] = f"{float(parts[3]) + offset[2] + motion[2] * amount:.6f}"
+                frame_lines[0] = " ".join(parts)
+        lines.extend(frame_lines)
     lines.extend(("end",))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def _write_root_motion_copy(
+    source: Path,
+    target: Path,
+    root_motion: tuple[float, float, float],
+) -> None:
+    """Create a _WF SMD by changing only bone 0 translation.
+
+    The source animation is copied verbatim apart from the XYZ position fields
+    on bone 0. This guarantees the generated walkframe version keeps exactly
+    the same root rotation as the untouched animation.
+    """
+    lines = source.read_text(encoding="utf-8", errors="ignore").splitlines()
+    times = [index for index, line in enumerate(lines) if line.lstrip().startswith("time ")]
+    frame_count = max(1, len(times))
+    denominator = max(1, frame_count - 1)
+    current_frame = -1
+    in_skeleton = False
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "skeleton":
+            in_skeleton = True
+            continue
+        if in_skeleton and stripped == "end":
+            in_skeleton = False
+            continue
+        if not in_skeleton:
+            continue
+        if stripped.startswith("time "):
+            current_frame += 1
+            continue
+        parts = stripped.split()
+        if current_frame < 0 or len(parts) < 7 or parts[0] != "0":
+            continue
+        amount = current_frame / denominator
+        parts[1] = f"{float(parts[1]) + root_motion[0] * amount:.6f}"
+        parts[2] = f"{float(parts[2]) + root_motion[1] * amount:.6f}"
+        parts[3] = f"{float(parts[3]) + root_motion[2] * amount:.6f}"
+        # Rotation fields parts[4:7] are intentionally untouched.
+        prefix = line[: len(line) - len(line.lstrip())]
+        lines[index] = prefix + " ".join(parts)
+
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def _body_root_motion(name: str) -> tuple[float, float, float] | None:
+    """Return standardized Source-space movement for base locomotion."""
+    upper = name.upper()
+    if "BAS_WALK" in upper:
+        return (0.0, -50.0, 0.0)
+    if "BAS_RUN" in upper and "BUKUU" not in upper:
+        return (0.0, -200.0, 0.0)
+    return None
+
+
+def _bukuu_root_motion(name: str) -> tuple[float, float, float] | None:
+    upper = name.upper()
+    if "BAS_BUKUU_F" in upper:
+        return (0.0, -300.0, 0.0)
+    if "BAS_BUKUU_B" in upper:
+        return (0.0, 200.0, 0.0)
+    if "BAS_BUKUU_L" in upper:
+        return (300.0, 0.0, 0.0)
+    if "BAS_BUKUU_R" in upper:
+        return (-300.0, 0.0, 0.0)
+    return None
 
 
 def _keyframe_markers(animation: EanAnimation) -> list[dict]:
@@ -474,8 +630,11 @@ def _local_bind_matrix(bone: EskBone) -> np.ndarray:
 
 def _global_bind_matrices(esk: EskFile) -> list[np.ndarray]:
     output: list[np.ndarray] = [np.eye(4, dtype=np.float64) for _ in esk.bones]
+    root_bake = _ROOT_CONTAINER_BAKE.get(id(esk))
     for bone in esk.bones:
         local = _local_bind_matrix(bone)
+        if bone.index == 0 and root_bake is not None:
+            local = root_bake @ local
         output[bone.index] = local if bone.parent is None else output[bone.parent] @ local
     return output
 
@@ -550,6 +709,67 @@ def _build_combined_skeleton(
     return combined, mappings
 
 
+def _strip_unused_exp_root(
+    esk: EskFile,
+    secondary_maps: dict[Path, list[int]],
+) -> tuple[EskFile, dict[Path, list[int]]]:
+    """Remove the unused character EXP_* container root from Source exports.
+
+    XV2 character skeletons commonly place an unused ``EXP_<character>_000``
+    bone above ``b_C_Base``. Source locomotion must operate on the real root,
+    so the container is removed, every remaining bone is renumbered, and
+    children of the removed container become true roots.
+    """
+    if not esk.bones:
+        return esk, secondary_maps
+
+    container = esk.bones[0]
+    if not container.name.upper().startswith("EXP_"):
+        return esk, secondary_maps
+    if not any(bone.name.casefold() == "b_c_base" for bone in esk.bones[1:]):
+        return esk, secondary_maps
+
+    old_to_new = {old.index: new for new, old in enumerate(esk.bones[1:])}
+    bones: list[EskBone] = []
+    for old in esk.bones[1:]:
+        old_parent = old.parent_index
+        parent = 0xFFFF if old_parent in (0, 0xFFFF) else old_to_new.get(old_parent, 0xFFFF)
+        child = old_to_new.get(old.child_index, 0xFFFF)
+        sibling = old_to_new.get(old.sibling_index, 0xFFFF)
+        bones.append(EskBone(
+            index=old_to_new[old.index],
+            name=old.name,
+            parent_index=parent,
+            child_index=child,
+            sibling_index=sibling,
+            ik_flag=old.ik_flag,
+            position=old.position,
+            rotation=old.rotation,
+            scale=old.scale,
+            absolute_matrix=old.absolute_matrix,
+        ))
+
+    remapped_secondary: dict[Path, list[int]] = {}
+    for path, mapping in secondary_maps.items():
+        remapped_secondary[path] = [
+            old_to_new.get(index, 0) for index in mapping
+        ]
+
+    stripped = EskFile(
+        path=esk.path,
+        version=esk.version,
+        endian=esk.endian,
+        flags=esk.flags,
+        skeleton_id=esk.skeleton_id,
+        bones=bones,
+    )
+    # Preserve the removed container's transform instead of silently dropping
+    # it. b_C_Base remains bone 0, but now has the same global orientation it
+    # had beneath EXP_* in Xenoverse.
+    _ROOT_CONTAINER_BAKE[id(stripped)] = _local_bind_matrix(container)
+    return stripped, remapped_secondary
+
+
 def _find_secondary_esk(entry: LibraryEntry, model_path: Path) -> Path | None:
     skeletons = [asset.path for asset in entry.assets if asset.kind == AssetKind.SKELETON]
     wanted = model_path.stem.casefold()
@@ -568,13 +788,9 @@ def write_physics_reference_smd(
     secondary_to_combined: list[int],
     emd,
     scale: float,
+    material_prefix: str = "",
 ) -> None:
-    """Export a secondary mesh attached to the main bind hierarchy.
-
-    Vertices are rebased from the secondary ESK bind space into the merged main
-    skeleton bind space. This is the attachment correction missing from the old
-    converter for hair, skirts, aprons, capes, and similar SCD meshes.
-    """
+    """Export a secondary mesh attached to the main bind hierarchy, plus outline shell."""
     secondary_by_name = {bone.name.casefold(): bone.index for bone in secondary_esk.bones}
     old_globals = _global_bind_matrices(secondary_esk)
     new_globals = _global_bind_matrices(combined_esk)
@@ -592,21 +808,20 @@ def write_physics_reference_smd(
     for model in emd.models:
         for mesh in model.meshes:
             for submesh in mesh.submeshes:
-                material = _safe_name(submesh.name, "material")
+                base_material = _safe_name(submesh.name, "material")
+                material = f"{material_prefix}_{base_material}" if material_prefix else base_material
                 positions = submesh.positions
                 normals = submesh.normals
                 uvs = submesh.uvs
                 for group in submesh.triangle_groups:
                     palette_old = [secondary_by_name.get(name.casefold(), 0) for name in group.bone_names]
-                    palette_new = [
-                        secondary_to_combined[index] if 0 <= index < len(secondary_to_combined) else 0
-                        for index in palette_old
-                    ]
+                    palette_new = [secondary_to_combined[index] if 0 <= index < len(secondary_to_combined) else 0 for index in palette_old]
                     indices = group.indices
                     for tri_start in range(0, len(indices) - 2, 3):
-                        tri = (indices[tri_start], indices[tri_start + 2], indices[tri_start + 1])
-                        lines.append(material)
-                        for vi in tri:
+                        source_tri = (indices[tri_start], indices[tri_start + 1], indices[tri_start + 2])
+                        converted_tri = (source_tri[0], source_tri[2], source_tri[1])
+                        records = {}
+                        for vi in source_tri:
                             if vi >= len(positions):
                                 continue
                             blend_i = submesh.blend_indices[vi] if vi < len(submesh.blend_indices) else None
@@ -627,7 +842,7 @@ def write_physics_reference_smd(
                             influences = [(old, new, weight / total) for old, new, weight in influences]
 
                             source_position = np.array((*positions[vi], 1.0), dtype=np.float64)
-                            source_normal = np.asarray(normals[vi] or (0.0, 0.0, 1.0), dtype=np.float64)
+                            source_normal = np.asarray(_normalise3(normals[vi] or (0.0, 0.0, 1.0)), dtype=np.float64)
                             moved_position = np.zeros(4, dtype=np.float64)
                             moved_normal = np.zeros(3, dtype=np.float64)
                             merged_links: dict[int, float] = {}
@@ -641,21 +856,732 @@ def write_physics_reference_smd(
                                 moved_normal += weight * (normal_matrix @ source_normal)
                                 merged_links[new_index] = merged_links.get(new_index, 0.0) + weight
 
+                            moved_normal = np.asarray(_normalise3(moved_normal), dtype=np.float64)
                             p = _vec_source(moved_position[:3], scale)
-                            n = _vec_source(moved_normal, 1.0)
-                            nl = math.sqrt(sum(value * value for value in n)) or 1.0
-                            n = tuple(value / nl for value in n)
+                            n = _normalise3(_vec_source(moved_normal, 1.0))
+                            outline_position = moved_position[:3] + moved_normal * OUTLINE_WIDTH
+                            outline_p = _vec_source(outline_position, scale)
+                            outline_n = tuple(-value for value in n)
                             uv = uvs[vi] if vi < len(uvs) and uvs[vi] is not None else (0.0, 0.0)
                             links = sorted(merged_links.items())
                             parent = max(links, key=lambda pair: pair[1])[0]
-                            link_text = " ".join(f"{index} {weight:.6f}" for index, weight in links)
-                            lines.append(
-                                f"{parent} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} "
-                                f"{n[0]:.6f} {n[1]:.6f} {n[2]:.6f} {uv[0]:.6f} {1.0-uv[1]:.6f} "
-                                f"{len(links)} {link_text}"
+                            records[vi] = (
+                                _smd_vertex_line(parent, p, n, uv, links),
+                                _smd_vertex_line(parent, outline_p, outline_n, uv, links),
                             )
+                        if len(records) != 3:
+                            continue
+                        lines.append(material)
+                        lines.extend(records[vi][0] for vi in converted_tri)
+                        lines.append("outline")
+                        lines.extend(records[vi][1] for vi in source_tri)
     lines.append("end")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def _model_set_and_part(path: Path, character_code: str) -> tuple[str, str]:
+    stem = path.stem
+    match = re.match(rf"(?i)^{re.escape(character_code)}_(\d{{3}})_(.+)$", stem)
+    if match:
+        return match.group(1), match.group(2).casefold()
+    match = re.search(r"(?i)(?:^|_)(\d{3})(?:_|$)", stem)
+    subset = match.group(1) if match else "000"
+    part = stem[match.end():] if match and match.end() < len(stem) else stem
+    return subset, part.casefold()
+
+
+def _mesh_ground_offset(model_paths: list[Path], scale: float) -> float:
+    minimum_z: float | None = None
+    for model_path in model_paths:
+        try:
+            emd = load_emd(model_path)
+            for model in emd.models:
+                for mesh in model.meshes:
+                    for submesh in mesh.submeshes:
+                        for position in submesh.positions:
+                            z = _vec_source(position, scale)[2]
+                            minimum_z = z if minimum_z is None else min(minimum_z, z)
+        except Exception:
+            continue
+    return -minimum_z if minimum_z is not None else 0.0
+
+
+def write_reference_animation_smd(path: Path, esk: EskFile, scale: float, ground_offset: float) -> None:
+    lines = ["version 1", *_nodes_block(esk), "skeleton", "time 0"]
+    frame_lines = _skeleton_frame_lines(esk, None, 0.0, scale)
+    if frame_lines:
+        parts = frame_lines[0].split()
+        if len(parts) >= 7:
+            parts[3] = f"{float(parts[3]) + ground_offset:.6f}"
+            frame_lines[0] = " ".join(parts)
+    lines.extend(frame_lines)
+    lines.append("end")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def _relative_smd(path: Path, output_dir: Path) -> str:
+    return path.relative_to(output_dir).as_posix()
+
+
+def _find_animation_by_token(animation_files: list[Path], *tokens: str) -> Path | None:
+    upper_tokens = tuple(token.upper() for token in tokens)
+    for path in animation_files:
+        if path.suffix.casefold() != ".smd":
+            continue
+        upper = path.stem.upper()
+        if all(token in upper for token in upper_tokens):
+            return path
+    return None
+
+
+def _strip_character_prefix(name: str, character_code: str) -> str:
+    """Remove only the active character's ID prefix from an animation name."""
+    code = _safe_name(character_code).upper()
+    return re.sub(rf"^{re.escape(code)}_", "", name, flags=re.IGNORECASE)
+
+
+def _sequence_name_from_smd(path: Path, character_code: str | None = None) -> str:
+    name = re.sub(r"^\d{3}_", "", path.stem)
+    if character_code:
+        name = _strip_character_prefix(name, character_code)
+    return _safe_name(name).upper()
+
+
+def _animation_root_translation(
+    esk: EskFile,
+    animation: EanAnimation,
+    scale: float,
+    frame: float = 0.0,
+) -> tuple[float, float, float]:
+    """Return bone 0's exported Source-space translation for one animation frame."""
+    frame_lines = _skeleton_frame_lines(esk, animation, frame, scale)
+    if not frame_lines:
+        return (0.0, 0.0, 0.0)
+    parts = frame_lines[0].split()
+    if len(parts) < 4:
+        return (0.0, 0.0, 0.0)
+    return (float(parts[1]), float(parts[2]), float(parts[3]))
+
+
+def _walk_ground_offset(
+    esk: EskFile,
+    ean_file,
+    scale: float,
+) -> float:
+    """Align GOK_BAS_WALK's root height to the normal grounded BAS_STAND pose.
+
+    The previous implementation reused the mesh/reference ground offset. That
+    value describes model-space mesh placement and is far too large when added
+    directly to an animation root. Here we compare the exported root height of
+    the shared walk against the character's grounded stand animation instead.
+    """
+    if ean_file is None:
+        return 0.0
+
+    walk = next(
+        (anim for anim in ean_file.animations if "GOK_BAS_WALK" in anim.name.upper()),
+        None,
+    )
+    if walk is None:
+        return 0.0
+
+    # Prefer the character's main grounded idle, not the two air-blend poses.
+    stand = next(
+        (
+            anim for anim in ean_file.animations
+            if re.search(r"(?:^|_)BAS_STAND_S$", anim.name.upper())
+        ),
+        None,
+    )
+    if stand is None:
+        stand = next(
+            (
+                anim for anim in ean_file.animations
+                if "BAS_STAND" in anim.name.upper() and not anim.name.upper().endswith(("_00_S", "_01_S"))
+            ),
+            None,
+        )
+    if stand is None:
+        return 0.0
+
+    walk_z = _animation_root_translation(esk, walk, scale)[2]
+    stand_z = _animation_root_translation(esk, stand, scale)[2]
+    return stand_z - walk_z
+
+
+def _smd_time_count(path: Path) -> int:
+    """Count exported SMD time records, matching qcgen.py's frame handling."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return sum(1 for line in handle if line.lstrip().startswith("time "))
+    except OSError:
+        return 0
+
+
+def _write_walkframes(handle, path: Path, axes: str = "LX LY") -> None:
+    """Write the 32 evenly-spaced walkframe records used by qcgen.py."""
+    total_frames = _smd_time_count(path)
+    if total_frames <= 0:
+        return
+    increase = total_frames / 32.0
+    handle.write("\n")
+    for index in range(1, 33):
+        frame = round(increase * index)
+        if frame > total_frames:
+            frame = total_frames
+        if frame == 0:
+            frame = 1
+        handle.write(f"    walkframe {frame} {axes}\n")
+
+
+def _path_key(path: Path, output_dir: Path) -> str:
+    try:
+        return _relative_smd(path, output_dir).casefold()
+    except ValueError:
+        return path.resolve().as_posix().casefold()
+
+
+def _is_additive_sequence_name(name: str) -> bool:
+    lower = name.casefold()
+    return (
+        lower.startswith("exp_")
+        or lower.startswith("face")
+        or lower.startswith("facialparts_")
+        or lower.endswith("_a")
+        or lower.endswith("_p")
+    )
+
+
+def _is_loop_sequence_name(name: str) -> bool:
+    lower = name.casefold()
+    loop = any(
+        keyword in lower
+        for keyword in (
+            "loop", "cycle", "idle", "glide", "walk", "run", "sprint",
+            "standby", "pose", "fall", "lp", "mrm_00", "dwn", "snt", "trm",
+        )
+    )
+    if any(keyword in lower for keyword in ("melee", "attack", "_a", "turn")):
+        loop = False
+    return loop
+
+
+def _animation_identity(path: Path) -> str:
+    """Animation name without the numeric file ID prefix."""
+    return re.sub(r"^\d{3}_", "", path.stem, flags=re.IGNORECASE)
+
+
+def _air_pair_key(path: Path) -> tuple[str, bool]:
+    identity = _animation_identity(path)
+    is_air = identity.upper().endswith("_S")
+    base = identity[:-2] if is_air else identity
+    return base.casefold(), is_air
+
+
+def _animation_index_from_smd(path: Path) -> int | None:
+    match = re.match(r"^(\d{3})_", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def _events_for_paths(
+    paths: Iterable[Path],
+    events_by_animation: dict[int, list[tuple[int, str]]] | None,
+) -> list[tuple[int, str]]:
+    values: set[tuple[int, str]] = set()
+    event_map = events_by_animation or {}
+    for path in paths:
+        index = _animation_index_from_smd(path)
+        if index is not None:
+            values.update(event_map.get(index, ()))
+    return sorted(values, key=lambda item: (item[0], item[1]))
+
+
+def _write_sequence_events(handle, events: Iterable[tuple[int, str]]) -> None:
+    values = list(events)
+    if not values:
+        return
+    handle.write("\n")
+    for frame, text in values:
+        safe = str(text).replace('"', "'")
+        handle.write(f'    {{ event 1100 {int(frame)} "{safe}" }}\n')
+
+
+def _write_generic_sequence(
+    handle,
+    paths: list[Path],
+    output_dir: Path,
+    character_code: str,
+    events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+) -> None:
+    primary = next((path for path in paths if not _air_pair_key(path)[1]), paths[0])
+    name = _safe_name(_strip_character_prefix(_air_pair_key(primary)[0], character_code)).upper()
+    is_additive = _is_additive_sequence_name(name)
+    is_loop = _is_loop_sequence_name(name)
+
+    handle.write(f'\n$Sequence "{name}" {{\n')
+    ordered = sorted(paths, key=lambda path: _air_pair_key(path)[1])
+    for path in ordered:
+        handle.write(f'    "{_relative_smd(path, output_dir)}"\n')
+    if not is_additive:
+        handle.write(f'    activity "ACT_{name}" 1\n')
+    if is_loop:
+        handle.write("    loop\n")
+    if len(ordered) == 2 and any(_air_pair_key(path)[1] for path in ordered):
+        handle.write("    blendwidth 2 blend air 0 1\n")
+
+    if is_additive:
+        handle.write(f'    subtract "{name}" 0\n')
+        handle.write("    delta\n")
+    elif not is_loop:
+        _write_walkframes(handle, primary)
+    elif any(keyword in name.casefold() for keyword in ("walk", "run", "sprint")):
+        handle.write("    LX LY\n")
+    _write_sequence_events(handle, _events_for_paths(ordered, events_by_animation or {}))
+    handle.write("}\n")
+
+
+def _atc_shot_direction(path: Path) -> str | None:
+    """Return F/L/B/R for directional ATC_SHOT and ATC_SHOT_*_LOOP animations.
+
+    Neutral ``ATC_SHOT_N`` variants are intentionally excluded and continue
+    through ordinary sequence generation. Optional trailing suffixes such as
+    ``_LOOP`` and ``_S`` do not change the detected movement direction.
+    """
+    identity = _animation_identity(path).upper()
+    match = re.search(
+        r"(?:^|_)ATC_SHOT_(F|L|B|R)(?=$|_(?:LOOP(?:_S)?|S)$)",
+        identity,
+    )
+    return match.group(1) if match else None
+
+
+def _atc_shot_is_loop(path: Path) -> bool:
+    """Return True when a directional ATC_SHOT animation is a LOOP variant."""
+    return bool(re.search(r"(?:^|_)ATC_SHOT_[FLBR]_LOOP(?:_S)?$", _animation_identity(path), re.IGNORECASE))
+
+
+def _atc_shot_group_name(path: Path, character_code: str) -> str:
+    """Build the shared ATC_SHOT sequence name without any character prefix.
+
+    Some animation sets use a character ID that differs from ``entry.code``
+    (shared/common animation sources are the usual cause), so stripping only
+    the active library-entry code is not reliable. Anchor on ``ATC_SHOT``
+    itself and discard everything before it.
+    """
+    identity = _safe_name(_animation_identity(path)).upper()
+    match = re.search(r"(?:^|_)(ATC_SHOT_(?:F|L|B|R)(?:_LOOP)?(?:_S)?)$", identity)
+    if match:
+        identity = match.group(1)
+    else:
+        identity = _strip_character_prefix(identity, character_code)
+    identity = re.sub(r"_(?:F|L|B|R)(?:_LOOP)?(?:_S)?$", "", identity)
+    return f"{identity}_LOOP" if _atc_shot_is_loop(path) else identity
+
+
+def _write_atc_shot_blend_sequence(
+    handle,
+    paths_by_direction: dict[str, Path],
+    output_dir: Path,
+    sequence_name: str,
+    events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+) -> None:
+    """Write one B/R/F/L/B directional blend sequence, matching BAS_BUKUU."""
+    rotations = {"F": 0, "B": -180, "L": 90, "R": -90}
+    animation_names: dict[str, str] = {}
+    for direction in ("F", "B", "L", "R"):
+        path = paths_by_direction[direction]
+        animation_name = f"@{sequence_name}_{direction}"
+        animation_names[direction] = animation_name
+        handle.write(
+            f'\n$Animation "{animation_name}" "{_relative_smd(path, output_dir)}" '
+            f'loop LX LY rotateto {rotations[direction]} alignto BAS_STAND\n'
+        )
+
+    handle.write(f'$Sequence "{sequence_name}" {{\n')
+    handle.write(f'    "{animation_names["B"]}"\n')
+    handle.write(f'    "{animation_names["R"]}"\n')
+    handle.write(f'    "{animation_names["F"]}"\n')
+    handle.write(f'    "{animation_names["L"]}"\n')
+    handle.write(f'    "{animation_names["B"]}"\n')
+    handle.write(f'    activity "ACT_{sequence_name}" 1\n')
+    handle.write('    blendwidth 5 blend move_yaw -180 180\n')
+    _write_sequence_events(handle, _events_for_paths([paths_by_direction['F']], events_by_animation or {}))
+    handle.write('}\n')
+
+
+def write_shared_qci(output_dir: Path, character_code: str, animation_files: list[Path], events_by_animation: dict[int, list[tuple[int, str]]] | None = None) -> Path:
+    target = output_dir / "shared.qci"
+    code = _safe_name(character_code).upper()
+    body_files = sorted(
+        (
+            path for path in animation_files
+            if path.suffix.casefold() == ".smd"
+            and "/body/" in f"/{path.as_posix()}"
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    original_body_files = [path for path in body_files if not path.stem.upper().endswith("_WF")]
+    wf_by_original = {
+        path.stem[:-3].casefold(): path
+        for path in body_files
+        if path.stem.upper().endswith("_WF")
+    }
+    face_files = sorted(
+        (path for path in animation_files if path.suffix.casefold() == ".smd" and "/face/" in f"/{path.as_posix()}"),
+        key=lambda path: path.name.casefold(),
+    )
+    used_body_paths: set[str] = set()
+
+    def mark(path: Path | None) -> None:
+        if path is not None:
+            used_body_paths.add(_path_key(path, output_dir))
+
+    def find_exact(token: str, *, air: bool | None = None) -> Path | None:
+        token = token.upper()
+        for path in original_body_files:
+            identity = _animation_identity(path).upper()
+            if identity != token:
+                continue
+            if air is None or identity.endswith("_S") == air:
+                return path
+        return None
+
+    stand = find_exact(f"{code}_BAS_STAND") or _find_animation_by_token(original_body_files, "BAS_STAND")
+    walk = _find_animation_by_token(original_body_files, "BAS_WALK")
+    run = next((p for p in original_body_files if "BAS_RUN" in p.stem.upper() and "BUKUU" not in p.stem.upper()), None)
+    stand_air = [
+        _find_animation_by_token(original_body_files, "BAS_STAND_00_S"),
+        next((p for p in original_body_files if _animation_identity(p).upper().endswith("BAS_STAND_S")), None),
+        _find_animation_by_token(original_body_files, "BAS_STAND_01_S"),
+    ]
+    stand_air = [path for path in stand_air if path is not None]
+    bukuu = {
+        direction: _find_animation_by_token(original_body_files, f"BAS_BUKUU_{direction}")
+        for direction in ("F", "B", "L", "R")
+    }
+
+    with target.open("w", encoding="utf-8", newline="\n") as f:
+        f.write('$SurfaceProp "flesh"\n')
+        f.write('$Contents "solid"\n')
+        f.write(f'$CDMaterials "models/cpthazama/dbxv2/{code}/"\n')
+        f.write('$CDMaterials "models/cpthazama/dbxv2/"\n\n')
+        f.write('$fps 60\n')
+        f.write('$JiggleBoneRealign 90 0 -90\n\n')
+        f.write('$poseparameter "move_yaw" -180 180 wrap\n\n')
+        f.write('$sequence "ref" "animations/ref.smd"\n\n')
+
+        if face_files:
+            blink = next((path for path in face_files if "FCE_BHV_BLINK" in path.stem.upper()), None)
+            f.write('$weightlist "EMO" {\n    "f_C_FaceRoot" 1\n}\n\n')
+            f.write('$Animation "EMO_NONE" "animations/ref.smd" frame 0 0 subtract "ref" 0 weightlist EMO\n')
+            if blink is not None:
+                f.write(
+                    f'$Animation "EMO_BLINK" "{_relative_smd(blink, output_dir)}" '
+                    'frame 0 0 subtract "ref" 0 weightlist EMO\n'
+                )
+                f.write('$sequence "FCE_BLINK" {\n')
+                f.write('    "EMO_NONE"\n    "EMO_BLINK"\n')
+                f.write('    blendcenter ref\n')
+                f.write('    blendwidth 2 blend "blink" 0 1\n')
+                f.write('    subtract FCE_BLINK 0\n    delta\n    autoplay\n    hidden\n}\n\n')
+
+            emotion_paths = [path for path in face_files if path is not blink]
+            emotion_names: list[str] = []
+            for path in emotion_paths:
+                seq = _sequence_name_from_smd(path, code)
+                short = re.sub(rf"^{re.escape(code)}_FCE_(?:EMO_)?", "", seq, flags=re.IGNORECASE)
+                anim = f"EMO_{short}"
+                emotion_names.append(anim)
+                f.write(
+                    f'$animation "{anim}" "{_relative_smd(path, output_dir)}" '
+                    'subtract ref 0 weightlist EMO\n'
+                )
+            if emotion_names:
+                f.write('\n$Sequence "FCE" {\n')
+                for anim in emotion_names:
+                    f.write(f'    "{anim}"\n')
+                f.write('    delta\n    autoplay\n    hidden\n')
+                f.write(f'    blendwidth {len(emotion_names)} blend FCE 0 {len(emotion_names)-1}\n')
+                f.write('}\n')
+
+        if stand:
+            mark(stand)
+            f.write('\n$Sequence "BAS_STAND" {\n')
+            f.write(f'    "{_relative_smd(stand, output_dir)}"\n')
+            f.write('    activity "ACT_IDLE" 1\n    loop\n')
+            _write_sequence_events(f, _events_for_paths([stand], events_by_animation))
+            f.write('}\n')
+
+        if len(stand_air) == 3:
+            for path in stand_air:
+                mark(path)
+            f.write('\n$Sequence "BAS_STAND_AIR" {\n')
+            for path in stand_air:
+                f.write(f'    "{_relative_smd(path, output_dir)}"\n')
+            f.write('    activity "ACT_IDLE_STIMULATED" 1\n')
+            f.write('    loop\n    blendwidth 3 blend aim_pitch -90 90\n')
+            _write_sequence_events(f, _events_for_paths([stand_air[1]], events_by_animation))
+            f.write('}\n')
+
+        if walk:
+            mark(walk)
+            wf = wf_by_original.get(walk.stem.casefold())
+            if wf:
+                mark(wf)
+            used = wf or walk
+            f.write(f'\n$Animation "@BAS_WALK" "{_relative_smd(used, output_dir)}" loop LX LY rotateto 0 alignto BAS_STAND\n')
+            f.write('$Sequence "BAS_WALK" {\n    "@BAS_WALK"\n    activity "ACT_WALK" 1\n')
+            _write_sequence_events(f, _events_for_paths([walk], events_by_animation))
+            f.write('}\n')
+
+        if run:
+            mark(run)
+            wf = wf_by_original.get(run.stem.casefold())
+            if wf:
+                mark(wf)
+            used = wf or run
+            f.write(f'\n$Animation "@BAS_RUN" "{_relative_smd(used, output_dir)}" loop LX LY rotateto 0 alignto BAS_STAND\n')
+            f.write('$Sequence "BAS_RUN" {\n    "@BAS_RUN"\n    activity "ACT_RUN" 1\n')
+            _write_sequence_events(f, _events_for_paths([run], events_by_animation))
+            f.write('}\n')
+
+        if all(bukuu.values()):
+            rotations = {"F": 0, "B": -180, "L": 90, "R": -90}
+            for direction in ("F", "B", "L", "R"):
+                path = bukuu[direction]
+                mark(path)
+                f.write(
+                    f'$Animation "@BAS_BUKUU_{direction}" "{_relative_smd(path, output_dir)}" '
+                    f'loop LX LY rotateto {rotations[direction]} alignto BAS_STAND origin 0 0 -10\n'
+                )
+            f.write('$Sequence "BAS_BUKUU" {\n')
+            f.write('    "@BAS_BUKUU_B"\n    "@BAS_BUKUU_R"\n    "@BAS_BUKUU_F"\n')
+            f.write('    "@BAS_BUKUU_L"\n    "@BAS_BUKUU_B"\n')
+            f.write('    activity "ACT_WALK_STIMULATED" 1\n')
+            f.write('    blendwidth 5 blend move_yaw -180 180\n}\n')
+
+            if all(wf_by_original.get(bukuu[d].stem.casefold()) for d in ("F", "B", "L", "R")):
+                for direction in ("F", "B", "L", "R"):
+                    wf = wf_by_original[bukuu[direction].stem.casefold()]
+                    mark(wf)
+                    f.write(
+                        f'$Animation "@BAS_BUKUU_WF_{direction}" "{_relative_smd(wf, output_dir)}" '
+                        f'loop LX LY rotateto {rotations[direction]} alignto BAS_STAND\n'
+                    )
+                f.write('$Sequence "BAS_BUKUU_WF" {\n')
+                f.write('    "@BAS_BUKUU_WF_B"\n    "@BAS_BUKUU_WF_R"\n    "@BAS_BUKUU_WF_F"\n')
+                f.write('    "@BAS_BUKUU_WF_L"\n    "@BAS_BUKUU_WF_B"\n')
+                f.write('    activity "ACT_RUN_STIMULATED" 1\n')
+                f.write('    blendwidth 5 blend move_yaw -180 180\n}\n')
+
+        # Directional ATC_SHOT animations are emitted as shared B/R/F/L/B
+        # move_yaw blend sequences, matching the BAS_BUKUU setup. The normal
+        # and _LOOP sets are grouped separately. Neutral (N) shots remain
+        # ordinary singular sequence blocks.
+        atc_shot_groups: dict[str, dict[str, Path]] = {}
+        for path in original_body_files:
+            if _path_key(path, output_dir) in used_body_paths:
+                continue
+            direction = _atc_shot_direction(path)
+            if direction is None:
+                continue
+            group_name = _atc_shot_group_name(path, code)
+            atc_shot_groups.setdefault(group_name, {}).setdefault(direction, path)
+
+        for group_name in sorted(atc_shot_groups):
+            directions = atc_shot_groups[group_name]
+            # Only consume the set when all four directions exist; incomplete
+            # sets fall through to generic generation rather than disappearing.
+            if not all(direction in directions for direction in ("F", "B", "L", "R")):
+                continue
+            for path in directions.values():
+                mark(path)
+            _write_atc_shot_blend_sequence(f, directions, output_dir, group_name, events_by_animation)
+
+        # Pair matching ground/_S animations into one air blend and consume both.
+        grouped: dict[str, list[Path]] = {}
+        for path in original_body_files:
+            if _path_key(path, output_dir) in used_body_paths:
+                continue
+            key, _is_air = _air_pair_key(path)
+            grouped.setdefault(key, []).append(path)
+
+        for key in sorted(grouped):
+            paths = grouped[key]
+            ground = [path for path in paths if not _air_pair_key(path)[1]]
+            air = [path for path in paths if _air_pair_key(path)[1]]
+            selected = [ground[0], air[0]] if ground and air else [paths[0]]
+            for path in selected:
+                mark(path)
+            _write_generic_sequence(f, selected, output_dir, code, events_by_animation)
+    return target
+
+def _smd_scd_bones(paths: Iterable[Path]) -> list[str]:
+    """Collect unique SCD_* bone names from exported mesh/physics SMD node blocks."""
+    bones: dict[str, str] = {}
+    node_pattern = re.compile(r'^\s*\d+\s+"([^"]+)"\s+-?\d+\s*$')
+
+    for path in paths:
+        try:
+            in_nodes = False
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not in_nodes:
+                        if line.casefold() == "nodes":
+                            in_nodes = True
+                        continue
+                    if line.casefold() == "end":
+                        break
+                    match = node_pattern.match(raw_line)
+                    if not match:
+                        continue
+                    name = match.group(1)
+                    if name.upper().startswith("SCD_"):
+                        bones.setdefault(name.casefold(), name)
+        except OSError:
+            continue
+
+    return sorted(bones.values(), key=str.casefold)
+
+
+def _write_jigglebones(handle, bones: Iterable[str]) -> None:
+    for bone in bones:
+        safe_bone = bone.replace('"', "'")
+        handle.write(
+            f'$jigglebone "{safe_bone}" {{ is_flexible {{ length 30 tip_mass 40 '
+            'pitch_stiffness 180 pitch_damping 15 yaw_stiffness 180 yaw_damping 15 '
+            'along_stiffness 180 along_damping 0 angle_constraint 39.999999 } }\n'
+        )
+
+
+def write_subset_qcs(output_dir: Path, character_code: str, mesh_files: list[Path]) -> list[Path]:
+    code = _safe_name(character_code).upper()
+    entries: dict[str, dict[str, Path]] = {}
+    for path in mesh_files:
+        # Source models do not need Xenoverse's alternate LOD mesh exports.
+        if re.search(r"_lod\d+(?:$|_)", path.stem, flags=re.IGNORECASE):
+            continue
+        subset, part = _model_set_and_part(path, code)
+        entries.setdefault(subset, {})[part] = path
+    if not entries:
+        return []
+    base_subset = "000" if "000" in entries else sorted(entries)[0]
+    base_parts = entries[base_subset]
+    outputs: list[Path] = []
+    for subset in sorted(entries):
+        resolved = dict(base_parts)
+        resolved.update(entries[subset])
+        target = output_dir / f"mdl_{subset}.qc"
+        with target.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(f'$modelname "cpthazama/xv2/{code}/{subset}.mdl"\n\n')
+            f.write('$maxverts 65536\n$maxbones 300\n\n')
+            resolved_paths = sorted(resolved.values(), key=lambda p: p.name.casefold())
+            for path in resolved_paths:
+                f.write(f'$model "model" "{_relative_smd(path, output_dir)}"\n')
+
+            scd_bones = _smd_scd_bones(resolved_paths)
+            if scd_bones:
+                f.write('\n')
+                _write_jigglebones(f, scd_bones)
+            f.write('\n$include "shared.qci"\n')
+        outputs.append(target)
+    return outputs
+
+
+def write_patch_vmts(output_dir: Path, character_code: str) -> list[Path]:
+    """Flatten converted textures/VMTs without costume-name collisions.
+
+    Xenoverse commonly reuses material names across costume sets. Prefix every
+    flattened material with its three-digit costume subset so the generated
+    Source material name matches the prefixed material written into each SMD.
+    """
+    code = _safe_name(character_code).upper()
+    outputs: list[Path] = []
+    texture_root = output_dir / "textures"
+    material_tgas = sorted(texture_root.glob("**/materials/*.tga"))
+    seen: set[str] = set()
+
+    for source_tga in material_tgas:
+        # Layout produced by export_textures:
+        # textures/<character_part_stem>/materials/<material>.tga
+        try:
+            part_stem = source_tga.parent.parent.name
+        except IndexError:
+            part_stem = ""
+        subset, _part = _model_set_and_part(Path(part_stem), code)
+        base_material = _safe_name(source_tga.stem)
+        material = f"{subset}_{base_material}"
+        key = material.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        flat_tga = texture_root / f"{material}.tga"
+        if source_tga != flat_tga:
+            shutil.copy2(source_tga, flat_tga)
+            outputs.append(flat_tga)
+
+        target = texture_root / f"{material}.vmt"
+        texture_path = f"models/cpthazama/dbxv2/{code}/{material}"
+        target.write_text(
+            '"Patch"\n{\n'
+            '    include "materials/models/cpthazama/dbxv2/patch_common.vmt"\n'
+            '    replace\n    {\n'
+            f'        "$basetexture"             "{texture_path}"\n'
+            f'        "$detail"                  "{texture_path}"\n'
+            '    }\n}\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        outputs.append(target)
+    return outputs
+
+
+def generate_source_compile_files(
+    output_dir: Path,
+    character_code: str,
+    esk: EskFile,
+    source_models: list[Path],
+    result: ExportResult,
+    scale: float,
+    events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+) -> None:
+    """Generate Source compile metadata without one stage blocking the others."""
+    if source_models:
+        try:
+            ground_offset = _mesh_ground_offset(source_models, scale)
+            ref_target = output_dir / "animations" / "ref.smd"
+            write_reference_animation_smd(ref_target, esk, scale, ground_offset)
+            result.animation_files.append(ref_target)
+        except Exception as exc:
+            result.warnings.append(f"Reference SMD generation: {exc}")
+
+    try:
+        qcs = write_subset_qcs(output_dir, character_code, result.mesh_files)
+        result.metadata_files.extend(qcs)
+    except Exception as exc:
+        result.warnings.append(f"QC generation: {exc}")
+
+    try:
+        qci = write_shared_qci(
+            output_dir, character_code, result.animation_files, events_by_animation or {}
+        )
+        result.metadata_files.append(qci)
+    except Exception as exc:
+        result.warnings.append(f"QCI generation: {exc}")
+
+    try:
+        generated_materials = write_patch_vmts(output_dir, character_code)
+        result.texture_files.extend(
+            path for path in generated_materials if path.suffix.casefold() == ".tga"
+        )
+        result.metadata_files.extend(
+            path for path in generated_materials if path.suffix.casefold() == ".vmt"
+        )
+    except Exception as exc:
+        result.warnings.append(f"VMT generation: {exc}")
 
 def export_character(
     entry: LibraryEntry,
@@ -697,6 +1623,7 @@ def export_character(
             result.warnings.append(f"Physics skeleton {secondary_path.name}: {exc}")
 
     esk, secondary_maps = _build_combined_skeleton(main_esk, list(secondary_unique.values()))
+    esk, secondary_maps = _strip_unused_exp_root(esk, secondary_maps)
 
     explicit_animation = str(entry.metadata.get("main_animation", ""))
     main_ean_path = Path(explicit_animation) if explicit_animation and Path(explicit_animation).is_file() else None
@@ -707,6 +1634,11 @@ def export_character(
     ean = load_ean(main_ean_path) if main_ean_path else None
 
     models = [a.path for a in entry.assets if a.kind == AssetKind.MODEL and not _is_physics_model(a)]
+    # GOK_BAS_WALK has a small vertical root offset. Align it against the
+    # character's regular grounded stand pose rather than using the much larger
+    # mesh/reference offset.
+    # walk_ground_offset = _walk_ground_offset(esk, ean, options.source_scale)
+    walk_ground_offset = 0
     additional_animation_count = 0
     if options.animations:
         for additional_entry in additional_entries:
@@ -731,7 +1663,10 @@ def export_character(
             try:
                 emd = load_emd(model_path)
                 target = mesh_dir / f"{_safe_name(model_path.stem)}.smd"
-                write_reference_smd(target, esk, emd, options.source_scale)
+                subset, _part = _model_set_and_part(model_path, entry.code)
+                write_reference_smd(
+                    target, esk, emd, options.source_scale, material_prefix=subset
+                )
                 result.mesh_files.append(target)
             except Exception as exc:
                 result.warnings.append(f"Mesh {model_path.name}: {exc}")
@@ -750,7 +1685,8 @@ def export_character(
                 emd = load_emd(model_path)
                 target = physics_dir / f"{_safe_name(model_path.stem)}.smd"
                 write_physics_reference_smd(
-                    target, esk, secondary, secondary_maps[secondary.path], emd, options.source_scale
+                    target, esk, secondary, secondary_maps[secondary.path], emd,
+                    options.source_scale, material_prefix=_model_set_and_part(model_path, entry.code)[0]
                 )
                 result.mesh_files.append(target)
             except Exception as exc:
@@ -768,8 +1704,27 @@ def export_character(
                     progress(f"Exporting body animation {animation.name}", done, max(total, 1))
                 try:
                     target = body_dir / f"{animation.index:03d}_{_safe_name(animation.name)}.smd"
-                    write_animation_smd(target, esk, animation, options.source_scale)
+                    # Always preserve the untouched XV2 animation. Locomotion
+                    # root motion is written to a separate _WF copy so its root
+                    # rotation remains byte-for-byte identical to the original.
+                    root_offset = (
+                        (0.0, 0.0, walk_ground_offset)
+                        if "GOK_BAS_WALK" in animation.name.upper()
+                        else None
+                    )
+                    write_animation_smd(
+                        target,
+                        esk,
+                        animation,
+                        options.source_scale,
+                        root_offset=root_offset,
+                    )
                     result.animation_files.append(target)
+                    root_motion = _body_root_motion(animation.name) or _bukuu_root_motion(animation.name)
+                    if root_motion is not None:
+                        wf_target = target.with_name(f"{target.stem}_WF.smd")
+                        _write_root_motion_copy(target, wf_target, root_motion)
+                        result.animation_files.append(wf_target)
                 except Exception as exc:
                     result.warnings.append(f"Body animation {animation.name}: {exc}")
                 done += 1
@@ -846,6 +1801,21 @@ def export_character(
         export_textures(entry, output_dir / "textures", result)
 
     bac_files = [asset.path for asset in entry.assets if asset.path.suffix.casefold() == ".bac"]
+    player_bac = next((
+        path for path in bac_files
+        if path.name.casefold().endswith("_player.bac")
+    ), None)
+    events_by_animation: dict[int, list[tuple[int, str]]] = {}
+    if options.events and player_bac is not None and ean is not None:
+        try:
+            frame_counts = {animation.index: max(1, int(animation.duration)) for animation in ean.animations}
+            events_by_animation = animation_events(
+                load_bac(player_bac),
+                animation_frame_counts=frame_counts,
+            )
+        except Exception as exc:
+            result.warnings.append(f"BAC event parsing {player_bac.name}: {exc}")
+
     for additional_entry in additional_entries:
         bac_files.extend(
             asset.path for asset in additional_entry.assets
@@ -858,9 +1828,15 @@ def export_character(
         write_event_manifest(event_target, bac_files)
         result.metadata_files.append(event_target)
     else:
-        # No BAC means no event output at all. Also remove stale output from older builds.
         if events_dir.exists():
             shutil.rmtree(events_dir)
+
+    try:
+        generate_source_compile_files(
+            output_dir, entry.code, esk, models, result, options.source_scale, events_by_animation
+        )
+    except Exception as exc:
+        result.warnings.append(f"QC/VMT generation: {exc}")
 
     summary = {
         "exporter_version": EXPORTER_VERSION,

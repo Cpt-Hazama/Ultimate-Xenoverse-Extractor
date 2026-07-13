@@ -49,6 +49,26 @@ _APPEARANCE_PARTS = {
     "Hair": "Hair",
 }
 
+# XenoKit/Xv2CoreLib save-field mapping. Save XML serializers may use either
+# friendly names or the raw SAV field names. Normalize both forms here.
+_APPEARANCE_ALIASES = {
+    "I_132": "FaceBase",
+    "I_136": "FaceForehead",
+    "I_140": "Eyes",
+    "I_144": "Nose",
+    "I_148": "Ears",
+    "I_152": "Hair",
+    "FaceBase": "FaceBase",
+    "FaceForehead": "FaceForehead",
+    "FaceEye": "Eyes",
+    "Eyes": "Eyes",
+    "FaceNose": "Nose",
+    "Nose": "Nose",
+    "FaceEar": "Ears",
+    "Ears": "Ears",
+    "Hair": "Hair",
+}
+
 _CLOTHING_PARTS = {
     "Top": "Bust",
     "Bottom": "Pants",
@@ -150,7 +170,8 @@ def parse_save_xml(path: Path) -> list[CacProfile]:
                 if child.tag == "BodySize":
                     continue
                 if "value" in child.attrib:
-                    appearance[child.tag] = _int(child.get("value"), -1)
+                    key = _APPEARANCE_ALIASES.get(child.tag, child.tag)
+                    appearance[key] = _int(child.get("value"), -1)
 
         stats_node = node.find("Stats")
         stats = {key: _int(value) for key, value in (stats_node.attrib.items() if stats_node is not None else [])}
@@ -159,7 +180,22 @@ def parse_save_xml(path: Path) -> list[CacProfile]:
         presets_node = node.find("Presets")
         if presets_node is not None:
             for preset_index, preset_node in enumerate(presets_node.findall("CacPreset")):
-                equipment = {tag: _node_value(preset_node, tag, -1) for tag in (*_CLOTHING_PARTS.keys(), "Accessory")}
+                equipment_aliases = {
+                    "Top": ("Top", "I_00"),
+                    "Bottom": ("Bottom", "I_04"),
+                    "Gloves": ("Gloves", "I_08"),
+                    "Shoes": ("Shoes", "I_12"),
+                    "Accessory": ("Accessory", "I_16"),
+                }
+                equipment: dict[str, int] = {}
+                for friendly, aliases in equipment_aliases.items():
+                    value = -1
+                    for alias in aliases:
+                        candidate = preset_node.find(alias)
+                        if candidate is not None and "value" in candidate.attrib:
+                            value = _int(candidate.get("value"), -1)
+                            break
+                    equipment[friendly] = value
                 colors = {
                     child.tag: _int(child.get("value"), 0)
                     for child in preset_node
@@ -572,6 +608,7 @@ def build_cac_entries(
         race_core_names = {
             f"{race}_000.esk", f"{race}.esk", f"{race}.ean",
             f"{race}.fce.ean", f"{race}.fce.lip.ean", f"{race}.cam.ean",
+            f"{race}_PLAYER.bac",
         }
         model_core_names = {
             f"{model_race}_000.esk", f"{model_race}.esk",
@@ -666,6 +703,9 @@ def build_cac_entries(
             "bcs_file": str(bcs_path), "bcs_loaded": visual_bcs is not None,
             "unresolved_visual_slots": unresolved_slots,
             "preset_index": preset.index,
+            "body_height": int(profile.body_size.get("height", 0)),
+            "body_width": int(profile.body_size.get("width", 0)),
+            "bcs_body_id": int(profile.body_size.get("height", 0)) * 3 + int(profile.body_size.get("width", 0)),
             "main_skeleton": str(main_skeleton) if main_skeleton else "",
             "main_animation": str(main_animation) if main_animation else "",
             "export_name": profile.name,

@@ -11,3 +11,8 @@ __all__ = [
 ]
 
 from .ean import EanAnimation, EanFile, EanFormatError, EanKeyframe, EanNode, EanTrack, load_ean
+from .bac import BacEntry, BacEvent, BacFile, BacFormatError, load_bac, animation_events
+
+__all__ += [
+    "BacEntry", "BacEvent", "BacFile", "BacFormatError", "load_bac", "animation_events",
+]

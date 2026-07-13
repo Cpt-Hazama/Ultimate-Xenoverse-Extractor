@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self.ui_sounds)
 
-        self.setWindowTitle(f"{APP_NAME} - 0.1.5")
+        self.setWindowTitle(f"{APP_NAME} - 0.1.6")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
@@ -108,7 +108,6 @@ class MainWindow(QMainWindow):
         refresh_action.triggered.connect(self.refresh)
         toolbar.addAction(refresh_action)
 
-        # Disabled until I can fully figure out CaC stuff
         # import_cac_action = QAction("Import XV2 Save XML", self)
         # import_cac_action.triggered.connect(self.import_cac_save_xml)
         # toolbar.addAction(import_cac_action)
