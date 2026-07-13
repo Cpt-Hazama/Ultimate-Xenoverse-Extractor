@@ -17,11 +17,8 @@ Run 'install_and_run.bat' to launch the tool. It will automatically install any 
 
 ## Media
 
-<img width="2551" height="1307" alt="1_default" src="https://github.com/user-attachments/assets/b543111d-4ce6-44d0-a1c3-900068427d71" />
-<img width="2546" height="1300" alt="2_mdl" src="https://github.com/user-attachments/assets/8967533d-1177-4110-9cf7-131741583f77" />
-<img width="974" height="1235" alt="3_mat" src="https://github.com/user-attachments/assets/db286767-8d61-485d-b7e9-4ae006d54713" />
-<img width="1769" height="1123" alt="4_anim" src="https://github.com/user-attachments/assets/bf197247-f740-49da-aa6c-bbaf4631a213" />
-<img width="848" height="1227" alt="1" src="https://github.com/user-attachments/assets/e5888ee4-7e28-460b-bf26-abaa2ccde003" />
+<img width="2555" height="1300" alt="image" src="https://github.com/user-attachments/assets/cd068ffc-107a-43a6-af3b-60fa27de25b6" />
+<img width="2560" height="1042" alt="2" src="https://github.com/user-attachments/assets/9a79a39d-d13b-4006-9832-a285bb9c77a6" />
 
 ## Credits
 
