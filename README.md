@@ -10,6 +10,11 @@ You MUST have your Xenoverse 2 files extracted somewhere, you can use a CPKBrows
 
 Run 'install_and_run.bat' to launch the tool. It will automatically install any required python modules that the tool utilizes. You can view Xenoverse 2's models/animations/textures/sounds among other things as well as extract them to SMD/TGA/JSON/WAV formats.
 
+## Known Issues / Known Missing Features
+
+- In newer builds of the tool, the 3D Viewport can cause some memory issues overtime when animating a skinned mesh. I have some things in place to clear up memory to prevent any crazy issues but, this is something that needs to be completely fixed later on
+- Decal-type textures are not currently applied in the 3D viewport. Not exactly a primary concern as this is an extractor tool but, I am aware that Appule is naked without his spots
+
 ## Media
 
 <img width="2551" height="1307" alt="1_default" src="https://github.com/user-attachments/assets/b543111d-4ce6-44d0-a1c3-900068427d71" />
