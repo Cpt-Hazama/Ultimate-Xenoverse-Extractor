@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self.ui_sounds)
 
-        self.setWindowTitle(f"{APP_NAME} - 0.2.2")
+        self.setWindowTitle(f"{APP_NAME} - 0.2.0")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
