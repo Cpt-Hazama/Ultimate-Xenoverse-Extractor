@@ -12,7 +12,6 @@ Run 'install_and_run.bat' to launch the tool. It will automatically install any 
 
 ## Known Issues / Known Missing Features
 
-- In newer builds of the tool, the 3D Viewport can cause some memory issues overtime when animating a skinned mesh. I have some things in place to clear up memory to prevent any crazy issues but, this is something that needs to be completely fixed later on
 - Decal-type textures are not currently applied in the 3D viewport. Not exactly a primary concern as this is an extractor tool but, I am aware that Appule is naked without his spots
 
 ## Media
