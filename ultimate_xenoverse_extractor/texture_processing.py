@@ -184,3 +184,27 @@ def compose_surface_texture(
     if requested != actual:
         note += f" (requested {requested}, clamped)"
     return pil_to_qimage(composed), note
+
+
+def compose_dyt_lightwarp(dyt: EmbFile | None, material: EmmMaterial | None) -> QImage | None:
+    """Extract the very same material-selected DYT strip as a GPU lightwarp.
+
+    Keep the original 128 horizontal palette samples (averaging the 4-pixel
+    strip vertically), rather than baking a single constant into the shader.
+    Missing/nonstandard DYT files fall back to neutral cel lighting.
+    """
+    image = choose_dyt_image(dyt)
+    if image is None:
+        return None
+    bands = find_dyt_bands(image)
+    if not bands:
+        return None
+    index = min(_material_dyt_index(material), len(bands) - 1)
+    band = bands[index].image.convert("RGBA")
+    pixels = []
+    for x in range(band.width):
+        colors = [band.getpixel((x, y)) for y in range(band.height)]
+        pixels.append(tuple(sum(color[c] for color in colors) // len(colors) for c in range(3)) + (255,))
+    strip = Image.new("RGBA", (band.width, 1))
+    strip.putdata(pixels)
+    return pil_to_qimage(strip)

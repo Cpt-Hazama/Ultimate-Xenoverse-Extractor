@@ -15,7 +15,7 @@ from PIL import Image
 from .models import AssetKind, LibraryEntry
 from .parsers import load_ean, load_emd, load_esk, load_bac, animation_events
 from .parsers.ean import EanAnimation, EanNode
-from .parsers.esk import EskBone, EskFile
+from .parsers.esk import EskBone, EskFile, EskFormatError
 
 # Xenoverse assets are authored at roughly meter scale. Source character assets
 # are conventionally authored in inches/Hammer units.
@@ -296,6 +296,39 @@ def write_animation_smd(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
+def _ground_stride_scale(entry: LibraryEntry, character_esk: EskFile) -> float:
+    """Compare world-space bind-height to Vegeta's VGT_000 rig.
+
+    If the install doesn't contain Vegeta, retain the legacy motion instead of
+    guessing a physical scale and corrupting exports. Ignore non-body attachment
+    bones, cameras and auxiliary physics helpers when measuring height.
+    """
+    def height(esk: EskFile) -> float:
+        matrices = _global_bind_matrices(esk)
+        valid = [float(matrices[b.index][1, 3]) for b in esk.bones
+                 if b.name.lower().startswith(("b_", "a_")) and "scd" not in b.name.lower()]
+        if len(valid) < 4:
+            valid = [float(m[1, 3]) for m in matrices]
+        return max(valid) - min(valid) if valid else 0.0
+
+    own_height = height(character_esk)
+    if own_height <= 1e-4:
+        return 1.0
+    # Installations may point at data/, data/chara, or the entire _Files root.
+    for ancestor in (entry.path, *entry.path.parents):
+        if ancestor.name.casefold() == "chara":
+            reference = ancestor / "VGT" / "VGT_000.esk"
+            if reference.is_file():
+                try:
+                    ref_height = height(load_esk(reference))
+                    if ref_height > 1e-4:
+                        return max(0.65, min(3.0, own_height / ref_height))
+                except (OSError, EskFormatError):
+                    pass
+            break
+    return 1.0
+
+
 def _write_root_motion_copy(
     source: Path,
     target: Path,
@@ -341,13 +374,20 @@ def _write_root_motion_copy(
     target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
-def _body_root_motion(name: str) -> tuple[float, float, float] | None:
-    """Return standardized Source-space movement for base locomotion."""
+def _body_root_motion(name: str, stride_scale: float = 1.0) -> tuple[float, float, float] | None:
+    """Ground locomotion: stride length scales with the character's rig height.
+
+    Vegeta is the reference for the original hardcoded distances. Keeping the
+    exact prior numbers at scale=1 preserves his behavior, while taller rigs
+    translate farther per animation cycle. Flight/Bukuu movement is unchanged.
+    """
     upper = name.upper()
+    # _S variants are air poses; keep their existing generic motion values.
+    ground_multiplier = stride_scale if not upper.endswith("_S") else 1.0
     if "BAS_WALK" in upper:
-        return (0.0, -50.0, 0.0)
+        return (0.0, -50.0 * ground_multiplier, 0.0)
     if "BAS_RUN" in upper and "BUKUU" not in upper:
-        return (0.0, -200.0, 0.0)
+        return (0.0, -200.0 * ground_multiplier, 0.0)
     return None
 
 
@@ -1087,10 +1127,24 @@ def _animation_index_from_smd(path: Path) -> int | None:
 def _events_for_paths(
     paths: Iterable[Path],
     events_by_animation: dict[int, list[tuple[int, str]]] | None,
+    events_by_path: dict[str, list[tuple[int, str]]] | None = None,
+    output_dir: Path | None = None,
 ) -> list[tuple[int, str]]:
+    """Resolve events for main and additional animation SMDs.
+
+    Main character events use the EAN animation-index map. Additional EANs have
+    their own index namespaces, so their events are keyed by the exported SMD
+    path instead of being mixed into the main character map.
+    """
     values: set[tuple[int, str]] = set()
     event_map = events_by_animation or {}
+    path_map = events_by_path or {}
     for path in paths:
+        path_key = _path_key(path, output_dir) if output_dir is not None else path.resolve().as_posix().casefold()
+        path_events = path_map.get(path_key)
+        if path_events is not None:
+            values.update(path_events)
+            continue
         index = _animation_index_from_smd(path)
         if index is not None:
             values.update(event_map.get(index, ()))
@@ -1113,9 +1167,11 @@ def _write_generic_sequence(
     output_dir: Path,
     character_code: str,
     events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+    events_by_path: dict[str, list[tuple[int, str]]] | None = None,
+    sequence_name: str | None = None,
 ) -> None:
     primary = next((path for path in paths if not _air_pair_key(path)[1]), paths[0])
-    name = _safe_name(_strip_character_prefix(_air_pair_key(primary)[0], character_code)).upper()
+    name = sequence_name or _safe_name(_strip_character_prefix(_air_pair_key(primary)[0], character_code)).upper()
     is_additive = _is_additive_sequence_name(name)
     is_loop = _is_loop_sequence_name(name)
 
@@ -1137,7 +1193,7 @@ def _write_generic_sequence(
         _write_walkframes(handle, primary)
     elif any(keyword in name.casefold() for keyword in ("walk", "run", "sprint")):
         handle.write("    LX LY\n")
-    _write_sequence_events(handle, _events_for_paths(ordered, events_by_animation or {}))
+    _write_sequence_events(handle, _events_for_paths(ordered, events_by_animation or {}, events_by_path, output_dir))
     handle.write("}\n")
 
 
@@ -1210,7 +1266,13 @@ def _write_atc_shot_blend_sequence(
     handle.write('}\n')
 
 
-def write_shared_qci(output_dir: Path, character_code: str, animation_files: list[Path], events_by_animation: dict[int, list[tuple[int, str]]] | None = None) -> Path:
+def write_shared_qci(
+    output_dir: Path,
+    character_code: str,
+    animation_files: list[Path],
+    events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+    additional_events_by_path: dict[str, list[tuple[int, str]]] | None = None,
+) -> Path:
     target = output_dir / "shared.qci"
     code = _safe_name(character_code).upper()
     body_files = sorted(
@@ -1231,6 +1293,17 @@ def write_shared_qci(output_dir: Path, character_code: str, animation_files: lis
         (path for path in animation_files if path.suffix.casefold() == ".smd" and "/face/" in f"/{path.as_posix()}"),
         key=lambda path: path.name.casefold(),
     )
+    additional_root = output_dir / "animations" / "additional"
+    additional_files = {
+        path.resolve(): path
+        for path in animation_files
+        if path.suffix.casefold() == ".smd"
+        and "/animations/additional/" in f"/{path.as_posix()}".casefold()
+    }
+    if additional_root.exists():
+        for path in additional_root.rglob("*.smd"):
+            additional_files.setdefault(path.resolve(), path)
+    additional_body_files = sorted(additional_files.values(), key=lambda path: path.as_posix().casefold())
     used_body_paths: set[str] = set()
 
     def mark(path: Path | None) -> None:
@@ -1267,7 +1340,7 @@ def write_shared_qci(output_dir: Path, character_code: str, animation_files: lis
         f.write(f'$CDMaterials "models/cpthazama/dbxv2/{code}/"\n')
         f.write('$CDMaterials "models/cpthazama/dbxv2/"\n\n')
         f.write('$fps 60\n')
-        f.write('$JiggleBoneRealign 90 0 -90\n\n')
+        f.write('$JiggleBoneRealign -90 0 -90\n\n')
         f.write('$poseparameter "move_yaw" -180 180 wrap\n\n')
         f.write('$sequence "ref" "animations/ref.smd"\n\n')
 
@@ -1415,6 +1488,44 @@ def write_shared_qci(output_dir: Path, character_code: str, animation_files: lis
             for path in selected:
                 mark(path)
             _write_generic_sequence(f, selected, output_dir, code, events_by_animation)
+
+        # Additional loaded EAN animations already live under
+        # animations/additional/<entry>/<ean>/. Include those exact exported
+        # SMDs in shared.qci and attach events from their own BAC namespace.
+        if additional_body_files:
+            f.write("\n// Additional loaded animations\n")
+            used_sequence_names = {
+                _safe_name(_strip_character_prefix(_air_pair_key(path)[0], code)).upper()
+                for path in original_body_files
+            }
+            by_folder: dict[Path, list[Path]] = {}
+            for path in additional_body_files:
+                by_folder.setdefault(path.parent, []).append(path)
+
+            for folder in sorted(by_folder, key=lambda value: value.as_posix().casefold()):
+                grouped_additional: dict[str, list[Path]] = {}
+                for path in by_folder[folder]:
+                    key, _is_air = _air_pair_key(path)
+                    grouped_additional.setdefault(key, []).append(path)
+
+                for key in sorted(grouped_additional):
+                    paths = grouped_additional[key]
+                    ground = [path for path in paths if not _air_pair_key(path)[1]]
+                    air = [path for path in paths if _air_pair_key(path)[1]]
+                    selected = [ground[0], air[0]] if ground and air else [paths[0]]
+                    base_name = _safe_name(_strip_character_prefix(_air_pair_key(selected[0])[0], code)).upper()
+                    sequence_name = base_name
+                    if sequence_name in used_sequence_names:
+                        folder_tag = _safe_name(folder.name).upper()
+                        sequence_name = f"{folder_tag}_{base_name}"
+                        suffix = 2
+                        while sequence_name in used_sequence_names:
+                            sequence_name = f"{folder_tag}_{base_name}_{suffix}"
+                            suffix += 1
+                    used_sequence_names.add(sequence_name)
+                    _write_generic_sequence(
+                        f, selected, output_dir, code, {}, additional_events_by_path, sequence_name
+                    )
     return target
 
 def _smd_scd_bones(paths: Iterable[Path]) -> list[str]:
@@ -1547,6 +1658,7 @@ def generate_source_compile_files(
     result: ExportResult,
     scale: float,
     events_by_animation: dict[int, list[tuple[int, str]]] | None = None,
+    additional_events_by_path: dict[str, list[tuple[int, str]]] | None = None,
 ) -> None:
     """Generate Source compile metadata without one stage blocking the others."""
     if source_models:
@@ -1566,7 +1678,7 @@ def generate_source_compile_files(
 
     try:
         qci = write_shared_qci(
-            output_dir, character_code, result.animation_files, events_by_animation or {}
+            output_dir, character_code, result.animation_files, events_by_animation or {}, additional_events_by_path or {}
         )
         result.metadata_files.append(qci)
     except Exception as exc:
@@ -1606,6 +1718,7 @@ def export_character(
     if skeleton_asset is None:
         raise ValueError("No ESK skeleton was found for this character.")
     main_esk = load_esk(skeleton_asset)
+    ground_stride_scale = _ground_stride_scale(entry, main_esk)
 
     physics_models = [asset.path for asset in entry.assets if _is_physics_model(asset)]
     secondary_by_model: dict[Path, EskFile] = {}
@@ -1640,6 +1753,7 @@ def export_character(
     # walk_ground_offset = _walk_ground_offset(esk, ean, options.source_scale)
     walk_ground_offset = 0
     additional_animation_count = 0
+    additional_events_by_path: dict[str, list[tuple[int, str]]] = {}
     if options.animations:
         for additional_entry in additional_entries:
             for asset in additional_entry.assets:
@@ -1720,7 +1834,7 @@ def export_character(
                         root_offset=root_offset,
                     )
                     result.animation_files.append(target)
-                    root_motion = _body_root_motion(animation.name) or _bukuu_root_motion(animation.name)
+                    root_motion = _body_root_motion(animation.name, ground_stride_scale) or _bukuu_root_motion(animation.name)
                     if root_motion is not None:
                         wf_target = target.with_name(f"{target.stem}_WF.smd")
                         _write_root_motion_copy(target, wf_target, root_motion)
@@ -1774,6 +1888,26 @@ def export_character(
                     )
                     target_dir = additional_root / _safe_name(additional_entry.code) / _safe_name(asset.path.stem)
                     target_dir.mkdir(parents=True, exist_ok=True)
+
+                    additional_event_map: dict[int, list[tuple[int, str]]] = {}
+                    if not is_camera and options.events:
+                        frame_counts = {anim.index: max(1, int(anim.duration)) for anim in additional_ean.animations}
+                        for bac_asset in additional_entry.assets:
+                            if bac_asset.path.suffix.casefold() != ".bac":
+                                continue
+                            try:
+                                parsed = animation_events(
+                                    load_bac(bac_asset.path),
+                                    animation_frame_counts=frame_counts,
+                                )
+                                for anim_index, values in parsed.items():
+                                    existing = additional_event_map.setdefault(anim_index, [])
+                                    existing.extend(value for value in values if value not in existing)
+                            except Exception as exc:
+                                result.warnings.append(
+                                    f"Additional BAC {additional_entry.code}/{bac_asset.path.name}: {exc}"
+                                )
+
                     for animation in additional_ean.animations:
                         if progress:
                             progress(
@@ -1789,6 +1923,10 @@ def export_character(
                             target = target_dir / f"{animation.index:03d}_{_safe_name(animation.name)}.smd"
                             write_animation_smd(target, esk, animation, options.source_scale)
                         result.animation_files.append(target)
+                        if not is_camera:
+                            values = additional_event_map.get(animation.index)
+                            if values:
+                                additional_events_by_path[_path_key(target, output_dir)] = list(values)
                         done += 1
                 except Exception as exc:
                     result.warnings.append(
@@ -1833,7 +1971,8 @@ def export_character(
 
     try:
         generate_source_compile_files(
-            output_dir, entry.code, esk, models, result, options.source_scale, events_by_animation
+            output_dir, entry.code, esk, models, result, options.source_scale,
+            events_by_animation, additional_events_by_path
         )
     except Exception as exc:
         result.warnings.append(f"QC/VMT generation: {exc}")

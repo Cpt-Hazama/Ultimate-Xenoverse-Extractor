@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import gc
 from pathlib import Path
+import re
+from collections import defaultdict
 
 try:
     from PySide6.QtCore import Qt, QSize, QTimer, QUrl
@@ -22,6 +24,7 @@ from .models import AssetKind, LibraryEntry
 from .scanner import build_library, summarize_assets
 from .parsers import EmbFormatError, EmdFormatError, EmmFormatError, EskFormatError, EanFormatError, load_emb, load_emd, load_emm, load_esk, load_ean
 from .viewport import ModelViewport
+from .memory_diagnostics import MemoryLogger
 from .settings import load_settings, save_settings
 from .source_export import ExportOptions, export_character
 from .ui_sounds import UISoundManager
@@ -48,6 +51,8 @@ class MainWindow(QMainWindow):
         self.cac_store_path = project_root / "userdata" / "cac_profiles.json"
         self.cac_profiles = load_profiles(self.cac_store_path)
         self.entries: list[LibraryEntry] = []
+        self._character_skill_index: dict[str, list[LibraryEntry]] = {}
+        self._ean_cache: dict[Path, object] = {}
         self.current_entry: LibraryEntry | None = None
         self.current_character_entry: LibraryEntry | None = None
         self.additional_animation_entries: list[LibraryEntry] = []
@@ -81,12 +86,18 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self.ui_sounds)
 
-        self.setWindowTitle(f"{APP_NAME} - 0.1.6")
+        self.setWindowTitle(f"{APP_NAME} - 0.2.2")
         self.resize(1500, 900)
         self._make_toolbar()
         self._make_ui()
         self._apply_style()
         self.setStatusBar(QStatusBar())
+        self._memory_logger = MemoryLogger(project_root / "userdata" / "memory_diagnostics.tsv")
+        self._memory_timer = QTimer(self)
+        self._memory_timer.setInterval(2000)
+        self._memory_timer.timeout.connect(self._sample_memory)
+        self._memory_label = QLabel("")
+        self.statusBar().addPermanentWidget(self._memory_label)
 
         previous = self.settings.get("asset_directory")
         if previous and Path(previous).is_dir():
@@ -123,9 +134,46 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.ui_sounds_action)
         toolbar.addSeparator()
 
+        self.memory_action = QAction("Memory Diagnostics", self)
+        self.memory_action.setCheckable(True)
+        self.memory_action.setToolTip("Track Windows private RAM versus Python allocations while animations play; writes userdata/memory_diagnostics.tsv")
+        self.memory_action.toggled.connect(self._toggle_memory_diagnostics)
+        toolbar.addAction(self.memory_action)
+
+        diagnostics_menu = self.menuBar().addMenu("Diagnostics")
+        diagnostics_menu.addAction(self.memory_action)
+        self.freeze_gpu_action = QAction("Freeze bone / mesh uploads (isolate GPU memory)", self)
+        self.freeze_gpu_action.setCheckable(True)
+        self.freeze_gpu_action.toggled.connect(lambda enabled: setattr(self.viewport, "freeze_gpu_uploads", enabled))
+        diagnostics_menu.addAction(self.freeze_gpu_action)
+        self.skip_models_action = QAction("Skip mesh drawing (isolate render driver)", self)
+        self.skip_models_action.setCheckable(True)
+        self.skip_models_action.toggled.connect(lambda enabled: setattr(self.viewport, "skip_model_draw", enabled))
+        diagnostics_menu.addAction(self.skip_models_action)
+
         self.path_label = QLabel(" No asset directory selected ")
         self.path_label.setObjectName("pathLabel")
         toolbar.addWidget(self.path_label)
+
+    def _toggle_memory_diagnostics(self, enabled: bool) -> None:
+        if enabled:
+            self._memory_logger.start()
+            self._sample_memory()
+            self._memory_timer.start()
+            self.statusBar().showMessage(
+                "Logging memory to userdata/memory_diagnostics.tsv", 6000
+            )
+        else:
+            self._memory_timer.stop()
+            self._memory_logger.stop()
+            self._memory_label.setText("")
+
+    def _sample_memory(self) -> None:
+        try:
+            self._memory_label.setText(self._memory_logger.sample(self.viewport))
+        except Exception as exc:
+            self._memory_label.setText(f"Memory diagnostics error: {exc}")
+            self._memory_timer.stop()
 
     def _make_ui(self) -> None:
         self.root_split = QSplitter(Qt.Horizontal)
@@ -150,7 +198,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.search)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setIconSize(QSize(42, 42))
+        self.tree.setIconSize(QSize(48, 48))
+        self.tree.setIndentation(8)
         self.tree.itemSelectionChanged.connect(self.library_selection_changed)
         left_layout.addWidget(self.tree)
         legend = QLabel("Blue: playable / CaC usable    Red: non-usable    Gray: unknown")
@@ -173,6 +222,7 @@ class MainWindow(QMainWindow):
         viewport_bar = QHBoxLayout()
         viewport_title = QLabel("3D VIEWPORT")
         viewport_title.setObjectName("sectionTitle")
+        viewport_title.setToolTip("Ctrl + left mouse drag in the viewport to reposition the cel-shading light.")
         viewport_bar.addWidget(viewport_title)
         viewport_bar.addStretch()
         self.solid_box = QCheckBox("Solid")
@@ -235,8 +285,11 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(right_heading)
         self.tabs = QTabWidget()
         self.tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        # A non-expanding, non-eliding bar preserves full labels and uses Qt's
+        # native left/right scroll buttons instead of compressing all tabs.
+        self.tabs.tabBar().setExpanding(False)
         self.tabs.tabBar().setUsesScrollButtons(True)
-        self.tabs.tabBar().setElideMode(Qt.ElideRight)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
         self.asset_list = QListWidget()
         self.asset_list.setAlternatingRowColors(True)
         self.asset_list.itemSelectionChanged.connect(self.asset_selected)
@@ -499,7 +552,10 @@ class MainWindow(QMainWindow):
             QTreeWidget::item, QListWidget::item { padding: 5px; }
             QTreeWidget::item:selected, QListWidget::item:selected { background: #31577a; }
             QHeaderView::section { background: #242830; color: #e8eaed; padding: 7px; border: 0; border-right: 1px solid #343942; }
-            QTabBar::tab { background: #242830; padding: 8px 15px; margin-right: 2px; }
+            QTabBar::tab { background: #242830; min-width: 84px; padding: 8px 13px; margin-right: 2px; }
+            QTabBar::scroller { width: 26px; }
+            QTabBar QToolButton { background: #287ac0; border: 1px solid #343942; border-radius: 3px; }
+            QTabBar QToolButton:disabled { background: #25282e; }
             QTabBar::tab:selected { background: #31577a; }
             QPushButton { background: #287ac0; border: 0; border-radius: 5px; padding: 10px; font-weight: 600; }
             QPushButton:disabled { background: #3b4048; color: #8d939c; }
@@ -557,6 +613,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Layout reset", 3000)
 
     def closeEvent(self, event) -> None:
+        self._memory_timer.stop()
+        self._memory_logger.stop()
         self.stop_sound()
         self.ui_sounds.play_window_close()
         self.settings["root_split_sizes"] = self.root_split.sizes()
@@ -586,6 +644,26 @@ class MainWindow(QMainWindow):
             return
         finally:
             QApplication.restoreOverrideCursor()
+        self._ean_cache.clear()
+        skill_index: dict[str, list[LibraryEntry]] = defaultdict(list)
+        actual_character_ids = {e.code.upper() for e in self.entries if e.category == "Characters"}
+        for candidate in self.entries:
+            if not candidate.category.startswith("Skills"):
+                continue
+            if not any(asset.kind in (AssetKind.ANIMATION, AssetKind.CAMERA) for asset in candidate.assets):
+                continue
+            # Skill folders are named 034_GOD_GODS, for example; the middle
+            # token is the character ID. Also recognize EAN suffixes like
+            # 1080_CMN_POW_GOK.ean which are character-specific overrides.
+            folder_ids = set(candidate.code.upper().split("_"))
+            file_ids = set()
+            for asset in candidate.assets:
+                if asset.kind in (AssetKind.ANIMATION, AssetKind.CAMERA):
+                    file_ids.update(asset.path.name.upper().replace(".CAM.EAN", "").replace(".EAN", "").split("_"))
+            for code in folder_ids | file_ids:
+                if code in actual_character_ids:
+                    skill_index[code].append(candidate)
+        self._character_skill_index = dict(skill_index)
         self.settings["asset_directory"] = str(directory)
         save_settings(self.settings)
         self.path_label.setText(f" {directory} ")
@@ -643,7 +721,14 @@ class MainWindow(QMainWindow):
         self._portrait_queue.clear()
         self.tree.clear()
         groups: dict[str, QTreeWidgetItem] = {}
-        for index, entry in enumerate(self.entries):
+        # Sort on the resolved display name, never the internal three-letter ID.
+        # Preserve original indices so Qt.UserRole still locates self.entries.
+        ordered_entries = sorted(enumerate(self.entries), key=lambda pair: (
+            pair[1].category.casefold(),
+            re.sub(r"\s*\[[^]]+\]\s*$", "", pair[1].label).casefold(),
+            pair[1].code.casefold(),
+        ))
+        for index, entry in ordered_entries:
             parent = groups.get(entry.category)
             if parent is None:
                 parent = QTreeWidgetItem([entry.category])
@@ -657,7 +742,7 @@ class MainWindow(QMainWindow):
             portrait_path = entry.metadata.get("portrait_emb")
             if isinstance(portrait_path, str) and portrait_path:
                 item.setData(0, Qt.UserRole + 1, portrait_path)
-                item.setSizeHint(0, QSize(0, 46))
+                item.setSizeHint(0, QSize(0, 54))
                 self._portrait_queue.append((item, Path(portrait_path), generation))
             parent.addChild(item)
         for parent in groups.values():
@@ -735,7 +820,10 @@ class MainWindow(QMainWindow):
                 candidates.append((area * (0.65 + 0.35 * square_bias), image))
             if candidates:
                 image = max(candidates, key=lambda pair: pair[0])[1]
-                pixmap = QPixmap.fromImage(image).scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                # Retain the original/highest-resolution pixmap. QIcon selects
+                # its appropriate mip/downscale at paint time, including HiDPI.
+                # Pre-shrinking to 40px blurred portraits on 125%-200% displays.
+                pixmap = QPixmap.fromImage(image)
                 icon = QIcon(pixmap)
         except (OSError, EmbFormatError):
             pass
@@ -1001,12 +1089,6 @@ class MainWindow(QMainWindow):
                 self.model_list.addItem(model_item)
         self.populate_assignments(entry)
         self.extract_button.setEnabled(True)
-        if self.model_list.count():
-            if entry.category == "CaC":
-                self.set_all_models_checked(True)
-            else:
-                self.model_list.item(0).setCheckState(Qt.Checked)
-
         race = str(entry.metadata.get("race", entry.code))
         explicit_skeleton = str(entry.metadata.get("main_skeleton", ""))
         main_skeleton = Path(explicit_skeleton) if explicit_skeleton and Path(explicit_skeleton).is_file() else None
@@ -1014,6 +1096,14 @@ class MainWindow(QMainWindow):
             main_skeleton = next((a.path for a in entry.assets if a.kind == AssetKind.SKELETON and a.path.stem.casefold() == f"{race}_000".casefold()), None)
         if main_skeleton:
             self.load_skeleton_to_viewport(main_skeleton, switch_tab=False)
+        # Load the correct rig before any mesh, including attached SCD physics.
+        # Default all available LOD0/body/face/secondary parts on; never LODs.
+        for i in range(self.model_list.count()):
+            item = self.model_list.item(i)
+            if "lod" not in Path(item.data(Qt.UserRole)).stem.casefold():
+                item.setCheckState(Qt.Checked)
+
+        self.viewport.fit_scene()
 
         explicit_animation = str(entry.metadata.get("main_animation", ""))
         main_animation = Path(explicit_animation) if explicit_animation and Path(explicit_animation).is_file() else None
@@ -1031,23 +1121,56 @@ class MainWindow(QMainWindow):
         if main_animation:
             self.load_animation_file(main_animation, switch_tab=False)
 
+        if entry.category == "Characters":
+            # Load skill EANs/cameras referencing the character ID (rather than
+            # requiring the user to pick each matching skill by hand).
+            matched = self._character_skill_index.get(entry.code.upper(), [])
+            seen: set[Path] = set()
+            self.additional_animation_entries = []
+            for skill in matched:
+                resolved = skill.path.resolve()
+                if resolved not in seen:
+                    self.additional_animation_entries.append(skill)
+                    seen.add(resolved)
+            self.additional_animation_paths = {
+                a.path.resolve() for sk in self.additional_animation_entries
+                for a in sk.assets if a.kind in (AssetKind.ANIMATION, AssetKind.CAMERA)
+            }
+            self._load_extra_camera_sources()
+            self._rebuild_animation_list(select_first=False)
+            self._rebuild_camera_combo()
         if entry.category == "CaC":
             skill_entries = resolve_skill_entries(entry.metadata_to_profile() if hasattr(entry, "metadata_to_profile") else self._profile_for_cac_entry(entry), self.entries, self.id_lists)
             self.additional_animation_entries = skill_entries
             self.additional_animation_paths = {asset.path.resolve() for skill in skill_entries for asset in skill.assets if asset.kind in (AssetKind.ANIMATION, AssetKind.CAMERA)}
-            self.additional_camera_sources.clear()
-            for skill in skill_entries:
-                for asset in skill.assets:
-                    if asset.kind != AssetKind.CAMERA:
-                        continue
-                    try:
-                        ean = load_ean(asset.path)
-                    except (OSError, EanFormatError):
-                        continue
-                    for animation in ean.animations:
-                        self.additional_camera_sources.append((ean, animation, skill.code, asset.path))
+            self._load_extra_camera_sources()
             self._rebuild_animation_list(select_first=False)
             self._rebuild_camera_combo()
+
+    def _load_cached_ean(self, path: Path):
+        key = path.resolve()
+        ean = self._ean_cache.get(key)
+        if ean is None:
+            ean = load_ean(path)
+            # A bounded cache keeps frequent character switches responsive without
+            # retaining every skill EAN in a large extracted game indefinitely.
+            if len(self._ean_cache) >= 16:
+                self._ean_cache.pop(next(iter(self._ean_cache)))
+            self._ean_cache[key] = ean
+        return ean
+
+    def _load_extra_camera_sources(self) -> None:
+        self.additional_camera_sources.clear()
+        for skill in self.additional_animation_entries:
+            for asset in skill.assets:
+                if asset.kind != AssetKind.CAMERA:
+                    continue
+                try:
+                    ean = self._load_cached_ean(asset.path)
+                except (OSError, EanFormatError):
+                    continue
+                for animation in ean.animations:
+                    self.additional_camera_sources.append((ean, animation, skill.code, asset.path))
 
     def _profile_for_cac_entry(self, entry: LibraryEntry):
         slot = int(entry.metadata.get("cac_slot", -1))
@@ -1071,7 +1194,7 @@ class MainWindow(QMainWindow):
                 if asset.kind != AssetKind.ANIMATION:
                     continue
                 try:
-                    ean = load_ean(asset.path)
+                    ean = self._load_cached_ean(asset.path)
                 except (OSError, EanFormatError):
                     continue
                 source_label = f"{entry.code} / {asset.path.name}"
@@ -1373,7 +1496,17 @@ class MainWindow(QMainWindow):
                 dyt = load_emb(dyt_path)
             except (OSError, EmbFormatError) as exc:
                 self.statusBar().showMessage(f"Could not load {dyt_path.name}: {exc}", 7000)
-        self.viewport.set_emd(emd, key, emm, emb, dyt)
+        secondary = None
+        if "_scd" in path.stem.casefold():
+            secondary_path = path.with_suffix(".esk")
+            if not secondary_path.is_file():
+                secondary_path = path.with_name(re.sub(r"_lod\d+$", "", path.stem, flags=re.I) + ".esk")
+            if secondary_path.is_file():
+                try:
+                    secondary = load_esk(secondary_path)
+                except (OSError, EskFormatError) as exc:
+                    self.statusBar().showMessage(f"Physics skeleton error {secondary_path.name}: {exc}", 7000)
+        self.viewport.set_emd(emd, key, emm, emb, dyt, secondary_esk=secondary)
         version = ".".join(str(part) for part in emd.version)
         mesh_count = sum(len(model.meshes) for model in emd.models)
         submesh_count = len(emd.submeshes)
@@ -1388,6 +1521,19 @@ class MainWindow(QMainWindow):
         except (OSError, EskFormatError) as exc:
             self.statusBar().showMessage(f"Failed to parse {path.name}: {exc}", 7000)
             return
+        if self.current_entry is not None and self.current_entry.category in {"Characters", "CaC"}:
+            # Same merging strategy as the already-working SMD exporter.
+            from .source_export import _build_combined_skeleton
+            secondary = []
+            for asset in self.current_entry.assets:
+                if (asset.kind == AssetKind.SKELETON and "_scd" in asset.path.stem.casefold()
+                        and "lod" not in asset.path.stem.casefold()):
+                    try:
+                        secondary.append(load_esk(asset.path))
+                    except (OSError, EskFormatError):
+                        pass
+            if secondary:
+                esk, _maps = _build_combined_skeleton(esk, secondary)
         self.viewport.set_esk(esk)
         if switch_tab:
             self.load_skeleton_inspector(path)
@@ -1416,7 +1562,7 @@ class MainWindow(QMainWindow):
         self.play_button.setText("Play")
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
-            ean = load_ean(path)
+            ean = self._load_cached_ean(path)
         except (OSError, EanFormatError) as exc:
             QMessageBox.warning(self, APP_NAME, f"Failed to parse {path.name}:\n{exc}")
             return
@@ -1538,7 +1684,7 @@ class MainWindow(QMainWindow):
         if path is None:
             return None
         try:
-            return load_ean(path)
+            return self._load_cached_ean(path)
         except (OSError, EanFormatError):
             return None
 
@@ -1630,6 +1776,34 @@ class MainWindow(QMainWindow):
         self.frame_slider.blockSignals(False)
         self.frame_label.setText(f"Frame 0 / {maximum}")
         self.viewport.set_animation(animation)
+        # Pair body EANs with their exact face/lip/camera clips on selection;
+        # camera EAN indices are NOT interchangeable with body EAN indices.
+        for combo, ean in ((self.face_combo, self.face_ean), (self.lip_combo, self.lip_ean)):
+            matched = self._exact_matching_animation(ean, animation)
+            wanted = next((i for i, clip in enumerate(ean.animations) if clip is matched), -1) if ean is not None and matched else -1
+            combo.blockSignals(True)
+            combo.setCurrentIndex(wanted + 1 if wanted >= 0 else 0)
+            combo.blockSignals(False)
+        camera_matches = []
+        if self.camera_ean is not None:
+            clip = self._matching_camera_animation(self.camera_ean, animation)
+            if clip is not None:
+                camera_matches.append((self.camera_ean.path, clip))
+        matched_camera_by_ean = {}
+        for ean, clip, label, path in self.additional_camera_sources:
+            key = id(ean)
+            if key not in matched_camera_by_ean:
+                matched_camera_by_ean[key] = self._matching_camera_animation(ean, animation)
+            if clip is matched_camera_by_ean[key] and clip is not None:
+                camera_matches.append((path, clip))
+        # Prefer the camera alongside this body EAN, then the character camera.
+        camera_matches.sort(key=lambda pair: (pair[0].parent != source_path.parent, pair[0] != source_path))
+        camera_clip = camera_matches[0][1] if camera_matches else None
+        self.camera_combo.blockSignals(True)
+        camera_index = next((i for i in range(1, self.camera_combo.count())
+                             if self.camera_combo.itemData(i) is camera_clip), 0) if camera_clip else 0
+        self.camera_combo.setCurrentIndex(camera_index)
+        self.camera_combo.blockSignals(False)
         self.refresh_animation_overlays()
         kind = "Additional / skill" if is_additional else "Character"
         self.animation_meta.setText(
